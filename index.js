@@ -1,6 +1,7 @@
 require('dotenv').config();
 const tmi = require('tmi.js');
-const https = require('https');
+const { validateToken, attachDebug, sendAndLog } = require('./troubleshoot');
+const db = require('./db');
 
 const opts = {
   options: { debug: true },
@@ -21,39 +22,11 @@ console.log(`Configured channels: ${opts.channels.join(', ')}`);
 let lastOutgoing = null;
 let lastOutgoingTs = 0;
 
-// Validate token with Twitch so we can confirm which login the OAuth token belongs to
-function validateToken(token) {
-  return new Promise((resolve, reject) => {
-    if (!token) return reject(new Error('No token provided'));
-    const trimmed = String(token).replace(/^oauth:/i, '');
-    const options = {
-      method: 'GET',
-      headers: {
-        Authorization: `OAuth ${trimmed}`
-      }
-    };
-    const req = https.request('https://id.twitch.tv/oauth2/validate', options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data || '{}');
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve(parsed);
-          } else {
-            const err = new Error(`Validate failed ${res.statusCode}`);
-            err.body = parsed;
-            reject(err);
-          }
-        } catch (err) {
-          reject(err);
-        }
-      });
-    });
-    req.on('error', (err) => reject(err));
-    req.end();
-  });
-}
+// In-memory caches loaded from DB at startup
+let adminsCache = new Set();
+let channelsCache = new Map();
+
+// token validation moved to `troubleshoot.js` (imported above)
 
 client.on('message', (channel, tags, message, self) => {
   // Always log inbound messages for debugging
@@ -71,24 +44,30 @@ client.on('message', (channel, tags, message, self) => {
       return;
     }
     // If it's from our own account but not matching our last outgoing message, continue processing.
-    // This handles cases where the account is the broadcaster and messages may appear with self=true.
   }
 
   if (!msg) return;
-  if (!msg) return;
 
-  // Log commands (messages that start with '!')
-  if (msg.startsWith('!')) {
-    console.log(`[${time}] Command received from ${username}: ${msg}`);
-  }
+  // Determine channel key (without leading '#') and prefix for this channel
+  const channelKey = channel && channel.startsWith('#') ? channel.slice(1) : (channel || '');
+  const prefix = channelsCache.has(channelKey) ? channelsCache.get(channelKey) : '!';
 
-  // Normalize command and arguments
-  const parts = msg.split(/\s+/);
+  // Only treat messages that start with the configured prefix as commands
+  if (!msg.startsWith(prefix)) return;
+
+  console.log(`[${time}] Command received from ${username}: ${msg}`);
+
+  // Normalize command and arguments (strip prefix)
+  const withoutPrefix = msg.slice(prefix.length).trim();
+  const parts = withoutPrefix.split(/\s+/);
   const command = parts[0].toLowerCase();
 
-  if (command === '!hello') {
+  const userId = String(tags['user-id'] || tags['userId'] || '');
+  const isAdmin = adminsCache.has(userId);
+
+  if (command === 'hello') {
     const reply = `Hello, ${username}!`;
-    sendAndLog(channel, reply)
+    sendAndLog(client, channel, reply)
       .then(() => {
         console.log(`[${time}] Replied to ${username} for ${command}`);
         lastOutgoing = reply;
@@ -96,11 +75,11 @@ client.on('message', (channel, tags, message, self) => {
       })
       .catch(err => console.error(`[${time}] Error sending message:`, err));
   }
-  
-  if (command === '!sendtest') {
+
+  if (command === 'sendtest') {
     const reply = `Test message ${Date.now()} from ${opts.identity.username}`;
     console.log(`[${time}] Sending test message: ${reply}`);
-    sendAndLog(channel, reply)
+    sendAndLog(client, channel, reply)
       .then(() => {
         console.log(`[${time}] Sent test message`);
         lastOutgoing = reply;
@@ -108,49 +87,45 @@ client.on('message', (channel, tags, message, self) => {
       })
       .catch(err => console.error(`[${time}] Error sending test message:`, err));
   }
-});
-
-// Helper to log the raw PRIVMSG line we intend to send, then send via tmi
-function sendAndLog(channel, text) {
-  try {
-    const rawLine = `PRIVMSG ${channel} :${text}`;
-    const time = new Date().toISOString();
-    console.log(`[${time}] OUTGOING: ${rawLine}`);
-  } catch (e) {
-    console.log('Failed to stringify outgoing message');
+  
+  // Admin-only: join a new channel and optionally set its prefix
+  // Usage: <prefix>join <channelName> [prefix]
+  if (command === 'join') {
+    if (!isAdmin) {
+      sendAndLog(client, channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    const target = parts[1];
+    if (!target) {
+      sendAndLog(client, channel, `Usage: ${prefix}join <channelName> [prefix]`);
+      return;
+    }
+    const requestedPrefix = parts[2] || '!';
+    // normalize channel name
+    const normalized = target.startsWith('#') ? target.slice(1) : target;
+    const joinChannel = `#${normalized}`;
+    client.join(joinChannel)
+      .then(async () => {
+        try {
+          await db.addChannel(normalized, requestedPrefix);
+          channelsCache.set(normalized, requestedPrefix);
+        } catch (e) {
+          console.error('DB addChannel error:', e);
+        }
+        sendAndLog(client, channel, `Joined ${joinChannel} with prefix '${requestedPrefix}'`)
+          .catch(()=>{});
+      })
+      .catch(err => {
+        console.error('Error joining channel:', err);
+        sendAndLog(client, channel, `Failed to join ${joinChannel}: ${err && err.message ? err.message : err}`)
+          .catch(()=>{});
+      });
   }
-  return client.say(channel, text);
-}
-
-client.on('connected', (addr, port) => {
-  console.log(`Connected to ${addr}:${port}`);
 });
 
-// Log raw IRC messages from the server for low-level debugging
-client.on('raw', (message) => {
-  try {
-    const time = new Date().toISOString();
-    console.log(`[${time}] RAW:`, message);
-  } catch (e) {
-    console.log('RAW (unserializable)');
-  }
-});
-
-// Listen for NOTICE messages from Twitch which often indicate why a message was rejected
-client.on('notice', (channel, msgid, message) => {
-  const time = new Date().toISOString();
-  console.warn(`[${time}] NOTICE ${msgid} on ${channel}: ${message}`);
-});
-
-client.on('disconnected', (reason) => {
-  console.warn('Disconnected:', reason);
-});
-
-client.on('reconnect', () => {
-  console.log('Reconnecting...');
-});
-
-// Validate token then connect. We won't print the token itself.
+// Attach debug handlers moved to troubleshoot.js
+attachDebug(client, opts);
+// Validate token, init DB, load caches, then connect
 (async () => {
   try {
     const info = await validateToken(process.env.TWITCH_OAUTH);
@@ -158,6 +133,16 @@ client.on('reconnect', () => {
     console.log(`Token scopes: ${Array.isArray(info.scopes) ? info.scopes.join(', ') : info.scopes || 'none'}`);
   } catch (err) {
     console.warn('Token validation failed:', err && err.body ? JSON.stringify(err.body) : err.message || err);
+  }
+
+  try {
+    await db.init();
+    adminsCache = await db.loadAdmins();
+    channelsCache = await db.loadChannels();
+    console.log(`Loaded admins: ${Array.from(adminsCache).join(', ')}`);
+    console.log(`Loaded channels: ${Array.from(channelsCache.keys()).join(', ')}`);
+  } catch (err) {
+    console.error('DB init/load error:', err);
   }
 
   client.connect().catch(err => {
