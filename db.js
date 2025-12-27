@@ -1,4 +1,5 @@
 const path = require('path');
+require('dotenv').config();
 const sqlite3 = require('sqlite3').verbose();
 const DB_PATH = path.join(__dirname, 'robobot.db');
 
@@ -19,8 +20,16 @@ function init() {
         prefix TEXT
       );`);
 
-      // Ensure initial admin (user asked to add uid 194696153)
-      db.run(`INSERT OR IGNORE INTO admins(uid) VALUES(?)`, ['194696153']);
+      // Ensure initial admin and default channel if configured via environment
+      const defaultAdmin = process.env.DEFAULT_ADMIN_UID;
+      const defaultChannel = process.env.DEFAULT_CHANNEL;
+      const defaultPrefix = process.env.DEFAULT_PREFIX || '!';
+      if (defaultAdmin) {
+        db.run(`INSERT OR IGNORE INTO admins(uid) VALUES(?)`, [String(defaultAdmin)]);
+      }
+      if (defaultChannel) {
+        db.run(`INSERT OR IGNORE INTO channels(channel, prefix) VALUES(?,?)`, [String(defaultChannel), String(defaultPrefix)]);
+      }
 
       db.close((err) => err ? reject(err) : resolve());
     });
@@ -62,6 +71,39 @@ function addChannel(channel, prefix) {
   });
 }
 
+function removeChannel(channel) {
+  return new Promise((resolve, reject) => {
+    const db = openDb();
+    db.run(`DELETE FROM channels WHERE channel = ?`, [channel], function(err) {
+      db.close();
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+function addAdmin(uid) {
+  return new Promise((resolve, reject) => {
+    const db = openDb();
+    db.run(`INSERT OR IGNORE INTO admins(uid) VALUES(?)`, [String(uid)], function(err) {
+      db.close();
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+function removeAdmin(uid) {
+  return new Promise((resolve, reject) => {
+    const db = openDb();
+    db.run(`DELETE FROM admins WHERE uid = ?`, [String(uid)], function(err) {
+      db.close();
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
 function isAdminUid(uid) {
   return new Promise((resolve, reject) => {
     const db = openDb();
@@ -78,5 +120,8 @@ module.exports = {
   loadAdmins,
   loadChannels,
   addChannel,
-  isAdminUid
+  removeChannel,
+  isAdminUid,
+  addAdmin,
+  removeAdmin
 };
