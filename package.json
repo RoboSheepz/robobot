@@ -1,0 +1,13 @@
+{
+  "name": "robobot",
+  "version": "0.1.0",
+  "description": "Simple Twitch hello-world bot using tmi.js",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "tmi.js": "^1.8.5"
+  }
+}
