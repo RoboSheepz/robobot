@@ -361,12 +361,13 @@ client.on('message', async (channel, tags, message, self) => {
     // Build help lines with prefix and auth level
     const cmdLines = [];
     const pfx = prefix;
-    cmdLines.push(`${pfx}ping - Pong! MrDestructoid <response time>ms (user)`);
+    cmdLines.push(`${pfx}ping - ping the bot`);
+    cmdLines.push(`${pfx}uid <uid/user> - return Twitch user or UID`);
     cmdLines.push(`${pfx}join <channel> [prefix] - Join channel and set prefix (admin)`);
     cmdLines.push(`${pfx}setprefix <prefix> - Set this channel's prefix (admin)`);
-    cmdLines.push(`${pfx}leavechannel <channel> - Leave channel and remove from DB (admin)`);
-    cmdLines.push(`${pfx}addadmin <uid> - Add a Twitch UID as admin (admin)`);
-    cmdLines.push(`${pfx}rmadmin <uid> - Remove a Twitch UID from admins (admin)`);
+    cmdLines.push(`${pfx}leave <channel> - Leave channel (admin)`);
+    cmdLines.push(`${pfx}addadmin <uid/user> - Add a user as admin (admin)`);
+    cmdLines.push(`${pfx}rmadmin <uid/user> - Remove a user from admins (admin)`);
     sendSplit(client, channel, cmdLines).catch(err => console.error('Help send error:', err));
   }
 
@@ -418,15 +419,15 @@ client.on('message', async (channel, tags, message, self) => {
   }
 
   // Admin-only: leave a channel
-  // Usage: <prefix>leavechannel <channelName>
-  if (command === 'leavechannel') {
+  // Usage: <prefix>leave <channelName>
+  if (command === 'leave') {
     if (!isAdmin) {
       sendAndRecord(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
     const target = parts[1];
     if (!target) {
-      sendAndRecord(channel, `Usage: ${prefix}leavechannel <channelName>`).catch(()=>{});
+      sendAndRecord(channel, `Usage: ${prefix}leave <channelName>`).catch(()=>{});
       return;
     }
     const normalized = target.startsWith('#') ? target.slice(1) : target;
