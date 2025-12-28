@@ -81,6 +81,11 @@ let lastOutgoingTs = 0;
 // recent outgoing messages to recognize echoes (message -> ts)
 const recentOutgoing = new Map();
 
+// Per-user, per-command cooldowns (ms). Default 5000ms (5s). Can be overridden via env COMMAND_COOLDOWN_MS
+const COMMAND_COOLDOWN_MS = Number(process.env.COMMAND_COOLDOWN_MS || 5000);
+// Map key: `${userIdOrName}:${command}` -> last run timestamp (ms)
+const commandCooldowns = new Map();
+
 // In-memory caches loaded from DB at startup
 let adminsCache = new Set();
 let channelsCache = new Map();
@@ -128,6 +133,24 @@ client.on('message', async (channel, tags, message, self) => {
 
   const userId = String(tags['user-id'] || tags['userId'] || '');
   const isAdmin = adminsCache.has(userId);
+
+  // Enforce per-user, per-command cooldown
+  try {
+    const nowMs = Date.now();
+    const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+    const cooldownKey = `${userKey}:${command}`;
+    const last = commandCooldowns.get(cooldownKey) || 0;
+    if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
+      const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
+      console.log(`[${time}] Cooldown: user ${userKey} attempted '${command}' — wait ${wait}s`);
+      return;
+    }
+    // record this invocation
+    commandCooldowns.set(cooldownKey, nowMs);
+  } catch (e) {
+    // if anything goes wrong, don't block command execution
+    console.error('Cooldown check error:', e);
+  }
 
   // Helper: fetch user info from Helix by login or id. Returns parsed user obj or null.
   function fetchHelixUser({ login, id }) {
