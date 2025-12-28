@@ -86,6 +86,9 @@ const COMMAND_COOLDOWN_MS = Number(process.env.COMMAND_COOLDOWN_MS || 5000);
 // Map key: `${userIdOrName}:${command}` -> last run timestamp (ms)
 const commandCooldowns = new Map();
 
+// Per-channel recent users (LRU of unique usernames). Map channelKey -> array of usernames (most recent first)
+const recentUsers = new Map();
+
 // In-memory caches loaded from DB at startup
 let adminsCache = new Set();
 let channelsCache = new Map();
@@ -98,6 +101,7 @@ client.on('message', async (channel, tags, message, self) => {
   const time = new Date().toISOString();
   const username = tags['display-name'] || tags.username;
   console.log(`[${time}] ${channel} <${username}>: ${message} (self=${self})`);
+  
 
   // If this message is an echo of our own outgoing message, ignore it to avoid loops.
   const msg = String(message || '').trim();
@@ -120,6 +124,21 @@ client.on('message', async (channel, tags, message, self) => {
   // Determine channel key (without leading '#') and prefix for this channel
   const channelKey = channel && channel.startsWith('#') ? channel.slice(1) : (channel || '');
   const prefix = channelsCache.has(channelKey) ? channelsCache.get(channelKey) : '!';
+
+  // Update recent users LRU (unique) for this channel
+  try {
+    const login = (tags && (tags.username || '')).toLowerCase() || String(username || '').toLowerCase();
+    if (login) {
+      const arr = recentUsers.get(channelKey) || [];
+      const idx = arr.indexOf(login);
+      if (idx !== -1) arr.splice(idx, 1);
+      arr.unshift(login);
+      if (arr.length > 100) arr.length = 100;
+      recentUsers.set(channelKey, arr);
+    }
+  } catch (e) {
+    console.error('Failed updating recentUsers:', e);
+  }
 
   // Only treat messages that start with the configured prefix as commands
   if (!msg.startsWith(prefix)) return;
@@ -414,6 +433,43 @@ client.on('message', async (channel, tags, message, self) => {
     // Attempt to detect ban status: Helix doesn't expose global ban easily; if user exists, report active
     const status = 'active';
     sendSplit(client, channel, [`Username: ${info.login}`, `Display: ${info.display_name}`, `UID: ${info.id}`, `Created: ${info.created_at}`, `Status: ${status}`]).catch(()=>{});
+  }
+
+  // Admin-only: massping - send a single (<=500 char) message listing most recent usernames for this channel
+  if (command === 'massping') {
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    try {
+      const arr = recentUsers.get(channelKey) || [];
+      if (!arr.length) {
+        queueSend(channel, `No recent users to massping.`).catch(()=>{});
+        return;
+      }
+      // Build a single message up to 500 characters containing @user mentions (most recent first)
+      const maxLen = 500;
+      let msgParts = [];
+      let curLen = 0;
+      for (const u of arr) {
+        const mention = `@${u}`;
+        const addition = (msgParts.length ? ' ' : '') + mention;
+        if ((curLen + addition.length) > maxLen) break;
+        msgParts.push(mention);
+        curLen += addition.length;
+      }
+      const out = msgParts.join(' ');
+      if (!out) {
+        queueSend(channel, `No recent users fit into a ${maxLen} char message.`).catch(()=>{});
+        return;
+      }
+      // Send as a single message (not split)
+      queueSend(channel, out).catch(err => console.error(`[${time}] Error sending massping:`, err));
+    } catch (e) {
+      console.error('massping error:', e);
+      queueSend(channel, `Failed to build massping message.`).catch(()=>{});
+    }
+    return;
   }
   
   // Admin-only: set prefix for current channel
