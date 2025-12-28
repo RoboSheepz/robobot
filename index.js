@@ -4,6 +4,61 @@ const { validateToken, attachDebug, sendAndLog } = require('./troubleshoot');
 const db = require('./db');
 const https = require('https');
 const os = require('os');
+// Global message queue settings
+const MESSAGE_INTERVAL_MS = Number(process.env.MESSAGE_INTERVAL_MS || 1500);
+
+// Global send queue
+const sendQueue = [];
+let sendProcessing = false;
+
+// Wrapper that records outgoing messages so echoed messages can be detected
+function sendAndRecord(channel, text) {
+  const now = Date.now();
+  lastOutgoing = String(text);
+  lastOutgoingTs = now;
+  recentOutgoing.set(String(text), now);
+  // prune old entries
+  for (const [k, ts] of recentOutgoing) {
+    if ((now - ts) > 60000) recentOutgoing.delete(k);
+  }
+  return sendAndLog(client, channel, text);
+}
+
+function enqueueSend(channel, text) {
+  return new Promise((resolve, reject) => {
+    sendQueue.push({ channel, text, resolve, reject });
+    if (!sendProcessing) processSendQueue();
+  });
+}
+
+async function processSendQueue() {
+  if (sendProcessing) return;
+  sendProcessing = true;
+  while (sendQueue.length) {
+    const item = sendQueue.shift();
+    try {
+      // record outgoing message immediately so echoes can be detected
+      const now = Date.now();
+      lastOutgoing = String(item.text);
+      lastOutgoingTs = now;
+      recentOutgoing.set(String(item.text), now);
+      for (const [k, ts] of recentOutgoing) {
+        if ((now - ts) > 60000) recentOutgoing.delete(k);
+      }
+      await sendAndLog(client, item.channel, item.text);
+      item.resolve();
+    } catch (err) {
+      item.reject(err);
+    }
+    await new Promise(r => setTimeout(r, MESSAGE_INTERVAL_MS));
+  }
+  sendProcessing = false;
+}
+
+// Convenience wrapper used throughout: queue the send
+function queueSend(channel, text) {
+  return enqueueSend(channel, text);
+}
 
 const opts = {
   options: { debug: true },
@@ -189,24 +244,12 @@ client.on('message', async (channel, tags, message, self) => {
     // append '...' to non-final messages
     const sends = chunks.map((text, idx) => {
       const out = (idx < chunks.length - 1) ? (text + '...') : text;
-      return sendAndRecord(channel, out);
+      return queueSend(channel, out);
     });
     return Promise.all(sends);
   }
 
-  // Wrapper that records outgoing messages so echoed messages can be detected
-  function sendAndRecord(channel, text) {
-    // record immediately so we can detect echoes reliably
-    const now = Date.now();
-    lastOutgoing = String(text);
-    lastOutgoingTs = now;
-    recentOutgoing.set(String(text), now);
-    // prune old entries
-    for (const [k, ts] of recentOutgoing) {
-      if ((now - ts) > 60000) recentOutgoing.delete(k);
-    }
-    return sendAndLog(client, channel, text);
-  }
+  // sendAndRecord is defined at module top-level to be available to the send queue
 
   if (command === 'ping') {
     // Compute response time using tmi timestamp if available
@@ -236,12 +279,12 @@ client.on('message', async (channel, tags, message, self) => {
   // Usage: <prefix>join <channelName> [prefix]
   if (command === 'join') {
     if (!isAdmin) {
-      sendAndRecord(channel, `You are not authorized to run this command.`).catch(()=>{});
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
     const target = parts[1];
     if (!target) {
-      sendAndRecord(channel, `Usage: ${prefix}join <channelName> [prefix]`);
+      queueSend(channel, `Usage: ${prefix}join <channelName> [prefix]`);
       return;
     }
     const requestedPrefix = parts[2] || '!';
@@ -256,61 +299,61 @@ client.on('message', async (channel, tags, message, self) => {
         } catch (e) {
           console.error('DB addChannel error:', e);
         }
-        sendAndRecord(channel, `Joined ${joinChannel} with prefix '${requestedPrefix}'`)
+        queueSend(channel, `Joined ${joinChannel} with prefix '${requestedPrefix}'`)
           .catch(()=>{});
       })
       .catch(err => {
         console.error('Error joining channel:', err);
-        sendAndRecord(channel, `Failed to join ${joinChannel}: ${err && err.message ? err.message : err}`)
+        queueSend(channel, `Failed to join ${joinChannel}: ${err && err.message ? err.message : err}`)
           .catch(()=>{});
       });
   }
 
   if (command === 'addadmin') {
     if (!isAdmin) {
-      sendAndRecord(channel, `You are not authorized to run this command.`).catch(()=>{});
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
     const target = parts[1];
     if (!target) {
-      sendAndRecord(channel, `Usage: ${prefix}addadmin <username|uid>`).catch(()=>{});
+      queueSend(channel, `Usage: ${prefix}addadmin <username|uid>`).catch(()=>{});
       return;
     }
     const uid = await resolveToUid(target);
     if (!uid) {
-      sendAndRecord(channel, `Could not resolve '${target}' to a Twitch account`).catch(()=>{});
+      queueSend(channel, `Could not resolve '${target}' to a Twitch account`).catch(()=>{});
       return;
     }
     db.addAdmin(uid).then(() => {
       adminsCache.add(String(uid));
-      sendAndRecord(channel, `Added admin uid ${uid}`).catch(()=>{});
+      queueSend(channel, `Added admin uid ${uid}`).catch(()=>{});
     }).catch(err => {
       console.error('Error adding admin:', err);
-      sendAndRecord(channel, `Failed to add admin: ${err && err.message ? err.message : err}`).catch(()=>{});
+      queueSend(channel, `Failed to add admin: ${err && err.message ? err.message : err}`).catch(()=>{});
     });
   }
 
   if (command === 'rmadmin') {
     if (!isAdmin) {
-      sendAndRecord(channel, `You are not authorized to run this command.`).catch(()=>{});
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
     const target = parts[1];
     if (!target) {
-      sendAndRecord(channel, `Usage: ${prefix}rmadmin <username|uid>`).catch(()=>{});
+      queueSend(channel, `Usage: ${prefix}rmadmin <username|uid>`).catch(()=>{});
       return;
     }
     const uid = await resolveToUid(target);
     if (!uid) {
-      sendAndRecord(channel, `Could not resolve '${target}' to a Twitch account`).catch(()=>{});
+      queueSend(channel, `Could not resolve '${target}' to a Twitch account`).catch(()=>{});
       return;
     }
     db.removeAdmin(uid).then(() => {
       adminsCache.delete(String(uid));
-      sendAndRecord(channel, `Removed admin uid ${uid}`).catch(()=>{});
+      queueSend(channel, `Removed admin uid ${uid}`).catch(()=>{});
     }).catch(err => {
       console.error('Error removing admin:', err);
-      sendAndRecord(channel, `Failed to remove admin: ${err && err.message ? err.message : err}`).catch(()=>{});
+      queueSend(channel, `Failed to remove admin: ${err && err.message ? err.message : err}`).catch(()=>{});
     });
   }
 
@@ -330,7 +373,7 @@ client.on('message', async (channel, tags, message, self) => {
   if (command === 'uid') {
     const arg = parts[1];
     if (!arg) {
-      sendAndRecord(channel, `Usage: ${prefix}uid <username|uid>`).catch(()=>{});
+      queueSend(channel, `Usage: ${prefix}uid <username|uid>`).catch(()=>{});
       return;
     }
     // determine if numeric
@@ -341,7 +384,7 @@ client.on('message', async (channel, tags, message, self) => {
       info = await fetchHelixUser({ login: arg.replace(/^#/, '').toLowerCase() });
     }
     if (!info) {
-      sendAndRecord(channel, `No Twitch account found for '${arg}'`).catch(()=>{});
+      queueSend(channel, `No Twitch account found for '${arg}'`).catch(()=>{});
       return;
     }
     // Attempt to detect ban status: Helix doesn't expose global ban easily; if user exists, report active
@@ -353,7 +396,7 @@ client.on('message', async (channel, tags, message, self) => {
   // Usage: <prefix>setprefix <newPrefix>
   if (command === 'setprefix') {
     if (!isAdmin) {
-      sendAndRecord(channel, `You are not authorized to run this command.`).catch(()=>{});
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
     const newPrefix = parts[1];
