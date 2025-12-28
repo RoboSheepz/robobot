@@ -1,15 +1,18 @@
-# RoboBot — Minimal Twitch Hello Bot
+# RoboBot — Clankslop Twitch "Bot"
 
 A minimal Node.js Twitch bot using `tmi.js` and `dotenv`.
 
 Setup
 
-1. Fill in the `.env` file with your Twitch credentials:
+1. Make the `.env` file and fill in the `.env` with your credentials and default configuration:
 
 ```
-TWITCH_USERNAME=your_bot_username
-TWITCH_OAUTH=oauth:your_oauth_token_here
-TWITCH_CHANNEL=channel_name
+TWITCH_USERNAME=your_bot's_username
+TWITCH_OAUTH=oauth:your_bot's_oauth_token_
+
+DEFAULT_ADMIN_UID=your_twitch_uid
+DEFAULT_CHANNEL=channel_for_bot_to_join
+DEFAULT_PREFIX=!
 ```
 
 2. Install dependencies:
@@ -26,7 +29,7 @@ npm start
 
 Usage
 
-- Type `!ping` in the configured Twitch channel; the bot will respond.
+- Type `!help` in the configured Twitch channel; the bot will respond.
 
 Security
 
