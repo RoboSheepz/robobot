@@ -3,6 +3,7 @@ const tmi = require('tmi.js');
 const { validateToken, attachDebug, sendAndLog } = require('./troubleshoot');
 const db = require('./db');
 const https = require('https');
+const os = require('os');
 
 const opts = {
   options: { debug: true },
@@ -104,6 +105,51 @@ client.on('message', async (channel, tags, message, self) => {
     });
   }
 
+  // Helper: collect system statistics (cpu %, memory usage, uptime, os info)
+  async function getSystemStats() {
+    function cpuTimes() {
+      const cpus = os.cpus();
+      let idle = 0, total = 0;
+      for (const cpu of cpus) {
+        for (const t in cpu.times) total += cpu.times[t];
+        idle += cpu.times.idle;
+      }
+      return { idle, total };
+    }
+
+    const start = cpuTimes();
+    // sample after short delay
+    await new Promise(r => setTimeout(r, 120));
+    const end = cpuTimes();
+    const idleDelta = end.idle - start.idle;
+    const totalDelta = end.total - start.total;
+    const cpuPercent = totalDelta > 0 ? Math.max(0, Math.min(100, Math.round((1 - idleDelta / totalDelta) * 100))) : 0;
+
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
+    const memPercent = totalMem > 0 ? Math.round((usedMem / totalMem) * 100) : 0;
+
+    const uptimeSec = os.uptime();
+    const uptimeHours = Math.floor(uptimeSec / 3600);
+    const uptimeMins = Math.floor((uptimeSec % 3600) / 60);
+    const uptimeSecs = Math.floor(uptimeSec % 60);
+    const uptimeStr = `${uptimeHours}h ${uptimeMins}m ${uptimeSecs}s`;
+
+    const platform = os.platform();
+    const release = os.release();
+
+    return {
+      cpuPercent,
+      usedMem,
+      totalMem,
+      memPercent,
+      uptimeStr,
+      platform,
+      release
+    };
+  }
+
   // Resolve an argument to a UID. Accepts a numeric uid or a username; returns uid or null.
   async function resolveToUid(arg) {
     if (!arg) return null;
@@ -173,8 +219,17 @@ client.on('message', async (channel, tags, message, self) => {
     } catch (e) {
       latency = 'unknown';
     }
-    const reply = `Pong! MrDestructoid ${latency}ms`;
-    sendAndRecord(channel, reply).catch(err => console.error(`[${time}] Error sending ping reply:`, err));
+
+    try {
+      const stats = await getSystemStats();
+      const usedMB = Math.round(stats.usedMem / 1024 / 1024);
+      const totalMB = Math.round(stats.totalMem / 1024 / 1024);
+      const reply = `Pong! MrDestructoid ${latency}ms | CPU: ${stats.cpuPercent}% | Mem: ${usedMB}MB/${totalMB}MB (${stats.memPercent}%) | Uptime: ${stats.uptimeStr} | OS: ${stats.platform} ${stats.release}`;
+      sendAndRecord(channel, reply).catch(err => console.error(`[${time}] Error sending ping reply:`, err));
+    } catch (e) {
+      const reply = `Pong! MrDestructoid ${latency}ms`;
+      sendAndRecord(channel, reply).catch(err => console.error(`[${time}] Error sending ping reply:`, err));
+    }
   }
   
   // Admin-only: join a new channel and optionally set its prefix
