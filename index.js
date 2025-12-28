@@ -5,7 +5,7 @@ const db = require('./db');
 const https = require('https');
 const os = require('os');
 // Global message queue settings
-const MESSAGE_INTERVAL_MS = Number(process.env.MESSAGE_INTERVAL_MS || 1500);
+const MESSAGE_INTERVAL_MS = Number(process.env.MESSAGE_INTERVAL_MS || 1100);
 
 // Global send queue
 const sendQueue = [];
