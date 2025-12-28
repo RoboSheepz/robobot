@@ -15,7 +15,6 @@ TWITCH_CHANNEL=channel_name
 2. Install dependencies:
 
 ```powershell
-cd 'g:\Dev\robobot'
 npm install
 ```
 
@@ -27,7 +26,7 @@ npm start
 
 Usage
 
-- Type `!hello` in the configured Twitch channel; the bot will respond.
+- Type `!ping` in the configured Twitch channel; the bot will respond.
 
 Security
 
