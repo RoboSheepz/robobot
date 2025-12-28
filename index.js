@@ -128,8 +128,10 @@ client.on('message', async (channel, tags, message, self) => {
 
   // Update recent users LRU (unique) for this channel
   try {
-    const login = (tags && (tags.username || '')).toLowerCase() || String(username || '').toLowerCase();
-    if (login) {
+    const loginRaw = (tags && (tags.username || '')) || String(username || '');
+    const login = String(loginRaw).toLowerCase().trim();
+    // Exclude bot accounts (any username containing 'bot')
+    if (login && !login.includes('bot')) {
       const arr = recentUsers.get(channelKey) || [];
       const idx = arr.indexOf(login);
       if (idx !== -1) arr.splice(idx, 1);
