@@ -121,9 +121,10 @@ client.on('message', async (channel, tags, message, self) => {
 
   if (!msg) return;
 
-  // Determine channel key (without leading '#') and prefix for this channel
+  // Determine channel key (without leading '#') and channel config for this channel
   const channelKey = channel && channel.startsWith('#') ? channel.slice(1) : (channel || '');
-  const prefix = channelsCache.has(channelKey) ? channelsCache.get(channelKey) : '!';
+  const chanCfg = channelsCache.get(channelKey) || { prefix: '!', require_admin: false };
+  const prefix = chanCfg.prefix || '!';
 
   // Update recent users LRU (unique) for this channel
   try {
@@ -169,6 +170,16 @@ client.on('message', async (channel, tags, message, self) => {
   } catch (e) {
     // if anything goes wrong, don't block command execution
     console.error('Cooldown check error:', e);
+  }
+
+  // Enforce per-channel admin requirement: if channel requires admin for all commands, block non-admins
+  try {
+    if (chanCfg && chanCfg.require_admin && !isAdmin) {
+      console.log(`[${time}] Channel ${channelKey} requires admin for all commands; rejecting ${username} for '${command}'`);
+      return;
+    }
+  } catch (e) {
+    console.error('Channel auth enforcement error:', e);
   }
 
   // Helper: fetch user info from Helix by login or id. Returns parsed user obj or null.
@@ -333,15 +344,18 @@ client.on('message', async (channel, tags, message, self) => {
     // normalize channel name
     const normalized = target.startsWith('#') ? target.slice(1) : target;
     const joinChannel = `#${normalized}`;
+    // detect 'admin' flag in additional args
+    const extraArgs = parts.slice(2).map(p => String(p || '').toLowerCase());
+    const requestedRequireAdmin = extraArgs.includes('admin');
     client.join(joinChannel)
       .then(async () => {
         try {
-          await db.addChannel(normalized, requestedPrefix);
-          channelsCache.set(normalized, requestedPrefix);
+          await db.addChannel(normalized, requestedPrefix, requestedRequireAdmin);
+          channelsCache.set(normalized, { prefix: requestedPrefix, require_admin: requestedRequireAdmin });
         } catch (e) {
           console.error('DB addChannel error:', e);
         }
-        queueSend(channel, `Joined ${joinChannel} with prefix '${requestedPrefix}'`)
+        queueSend(channel, `Joined ${joinChannel} with prefix '${requestedPrefix}'${requestedRequireAdmin ? ' (admin-only)' : ''}`)
           .catch(()=>{});
       })
       .catch(err => {
@@ -403,13 +417,28 @@ client.on('message', async (channel, tags, message, self) => {
     // Build help lines with prefix and auth level
     const cmdLines = [];
     const pfx = prefix;
-    cmdLines.push(`${pfx}ping - ping the bot`);
-    cmdLines.push(`${pfx}uid <uid/user> - return Twitch user or UID`);
-    cmdLines.push(`${pfx}join <channel> [prefix] - Join channel and set prefix (admin)`);
-    cmdLines.push(`${pfx}setprefix <prefix> - Set this channel's prefix (admin)`);
-    cmdLines.push(`${pfx}leave <channel> - Leave channel (admin)`);
-    cmdLines.push(`${pfx}addadmin <uid/user> - Add a user as admin (admin)`);
-    cmdLines.push(`${pfx}rmadmin <uid/user> - Remove a user from admins (admin)`);
+    // default auth per-command
+    const defaultAuth = {
+      ping: 'user',
+      uid: 'user',
+      join: 'admin',
+      setprefix: 'admin',
+      leave: 'admin',
+      addadmin: 'admin',
+      rmadmin: 'admin',
+      massping: 'admin'
+    };
+    // if channel enforces admin for all commands, override default
+    const effectiveAuth = (cmd) => (chanCfg && chanCfg.require_admin) ? 'admin' : (defaultAuth[cmd] || 'user');
+
+    cmdLines.push(`${pfx}ping - ping the bot (${effectiveAuth('ping')})`);
+    cmdLines.push(`${pfx}uid <uid/user> - return Twitch user or UID (${effectiveAuth('uid')})`);
+    cmdLines.push(`${pfx}join <channel> [prefix] [admin] - Join channel and set prefix (${effectiveAuth('join')})`);
+    cmdLines.push(`${pfx}setprefix <prefix> - Set this channel's prefix (${effectiveAuth('setprefix')})`);
+    cmdLines.push(`${pfx}leave <channel> - Leave channel (${effectiveAuth('leave')})`);
+    cmdLines.push(`${pfx}addadmin <uid/user> - Add a user as admin (${effectiveAuth('addadmin')})`);
+    cmdLines.push(`${pfx}rmadmin <uid/user> - Remove a user from admins (${effectiveAuth('rmadmin')})`);
+    cmdLines.push(`${pfx}massping - send single message of recent users (${effectiveAuth('massping')})`);
     sendSplit(client, channel, cmdLines).catch(err => console.error('Help send error:', err));
   }
 
@@ -488,7 +517,9 @@ client.on('message', async (channel, tags, message, self) => {
     const normalized = channelKey;
     db.addChannel(normalized, newPrefix)
       .then(() => {
-        channelsCache.set(normalized, newPrefix);
+        // preserve existing require_admin setting when only updating prefix
+        const existing = channelsCache.get(normalized) || { prefix: newPrefix, require_admin: false };
+        channelsCache.set(normalized, { prefix: newPrefix, require_admin: existing.require_admin });
         sendAndRecord(channel, `Prefix for ${normalized} set to '${newPrefix}'`).catch(()=>{});
       })
       .catch(err => {
