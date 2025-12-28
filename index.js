@@ -302,6 +302,31 @@ client.on('message', async (channel, tags, message, self) => {
     return Promise.all(sends);
   }
 
+  // Helper to extract the first token from a string preserving quoted tokens
+  function extractFirstTokenPreservingQuotes(s) {
+    if (!s) return { token: null, rest: '' };
+    let str = String(s).trim();
+    if (!str) return { token: null, rest: '' };
+    const firstChar = str[0];
+    if (firstChar === '"' || firstChar === "'") {
+      const quote = firstChar;
+      let i = 1;
+      let token = '';
+      while (i < str.length) {
+        const ch = str[i];
+        if (ch === quote) { i++; break; }
+        if (ch === '\\' && i + 1 < str.length) { token += str[i+1]; i += 2; continue; }
+        token += ch; i++;
+      }
+      const rest = str.slice(i).trim();
+      return { token, rest };
+    }
+    // unquoted - first whitespace-separated token
+    const m = str.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+    if (!m) return { token: str, rest: '' };
+    return { token: m[1], rest: (m[2] || '').trim() };
+  }
+
   // sendAndRecord is defined at module top-level to be available to the send queue
 
   if (command === 'ping') {
@@ -335,18 +360,36 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
-    const target = parts[1];
+    // parse target and optional prefix (prefix may be quoted to include spaces)
+    const remainderAfterCommand = withoutPrefix.slice(command.length).trim();
+    const first = extractFirstTokenPreservingQuotes(remainderAfterCommand);
+    const target = first.token;
     if (!target) {
       queueSend(channel, `Usage: ${prefix}join <channelName> [prefix]`);
       return;
     }
-    const requestedPrefix = parts[2] || '!';
+    const afterTarget = first.rest || '';
+    const second = extractFirstTokenPreservingQuotes(afterTarget);
+    let requestedPrefix = '!';
+    let requestedRequireAdmin = false;
+    if (second.token) {
+      // if the provided token is exactly 'admin' and there is no further text, treat it as flag
+      if (String(second.token).toLowerCase() === 'admin' && (!second.rest || !second.rest.trim())) {
+        requestedPrefix = '!';
+        requestedRequireAdmin = true;
+      } else {
+        requestedPrefix = second.token;
+        const remainingFlags = (second.rest || '').split(/\s+/).map(p => String(p || '').toLowerCase()).filter(Boolean);
+        if (remainingFlags.includes('admin')) requestedRequireAdmin = true;
+      }
+    } else {
+      // no second token; check if afterTarget contains 'admin' as bare word
+      const maybeFlags = (afterTarget || '').split(/\s+/).map(p => String(p || '').toLowerCase()).filter(Boolean);
+      if (maybeFlags.includes('admin')) requestedRequireAdmin = true;
+    }
     // normalize channel name
     const normalized = target.startsWith('#') ? target.slice(1) : target;
     const joinChannel = `#${normalized}`;
-    // detect 'admin' flag in additional args
-    const extraArgs = parts.slice(2).map(p => String(p || '').toLowerCase());
-    const requestedRequireAdmin = extraArgs.includes('admin');
     client.join(joinChannel)
       .then(async () => {
         try {
@@ -515,10 +558,10 @@ client.on('message', async (channel, tags, message, self) => {
     }
     // update DB and cache for this channel
     const normalized = channelKey;
-    db.addChannel(normalized, newPrefix)
+    const existing = channelsCache.get(normalized) || { prefix: newPrefix, require_admin: false };
+    db.addChannel(normalized, newPrefix, existing.require_admin)
       .then(() => {
         // preserve existing require_admin setting when only updating prefix
-        const existing = channelsCache.get(normalized) || { prefix: newPrefix, require_admin: false };
         channelsCache.set(normalized, { prefix: newPrefix, require_admin: existing.require_admin });
         sendAndRecord(channel, `Prefix for ${normalized} set to '${newPrefix}'`).catch(()=>{});
       })
