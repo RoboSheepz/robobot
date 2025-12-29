@@ -1081,13 +1081,23 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
-    const recentUsersList = recentUsers.get(channelKey) || [];
-    if (!recentUsersList.length) {
-      queueSend(channel, `No recent users recorded for this channel.`).catch(()=>{});
-      return;
+    try {
+      // Get recent chat messages from DB and extract unique users
+      const chatRows = await db.getRecentChatMessages(channelKey, 1000, 0);
+      const uniqueUsers = new Set();
+      for (const row of chatRows) {
+        if (row.user) uniqueUsers.add(row.user);
+      }
+      if (!uniqueUsers.size) {
+        queueSend(channel, `No recent users recorded for this channel.`).catch(()=>{});
+        return;
+      }
+      const message = Array.from(uniqueUsers).join(' ');
+      queueSend(channel, message).catch(()=>{});
+    } catch (e) {
+      console.error('Massping error:', e);
+      sendSplit(client, channel, [`Failed to fetch recent users: ${e && e.message ? e.message : 'error'}`]).catch(()=>{});
     }
-    const message = recentUsersList.join(' ');
-    queueSend(channel, message).catch(()=>{});
   }
 
   // Ask LLM including recent channel chat history as context: <prefix>ask <prompt>
