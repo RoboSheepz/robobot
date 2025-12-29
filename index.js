@@ -582,7 +582,7 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `LLM prompt updated.`).catch(()=>{});
     } catch (e) {
       console.error('Failed to set LLM prompt:', e);
-      queueSend(channel, `Failed to update prompt.`).catch(()=>{});
+      sendSplit(client, channel, [`Failed to update prompt: ${e && e.message ? e.message : 'error'}`]).catch(()=>{});
     }
     return;
   }
@@ -610,7 +610,7 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `Character set: ${label}`).catch(()=>{});
     } catch (e) {
       console.error('addchar error:', e);
-      queueSend(channel, `Failed to add character: ${e && e.message ? e.message : 'error'}`).catch(()=>{});
+      sendSplit(client, channel, [`Failed to add character: ${e && e.message ? e.message : 'error'}`]).catch(()=>{});
     }
     return;
   }
@@ -955,7 +955,7 @@ client.on('message', async (channel, tags, message, self) => {
       })
       .catch(err => {
         console.error('Error joining channel:', err);
-        queueSend(channel, `Failed to join ${joinChannel}: ${err && err.message ? err.message : err}`)
+        sendSplit(client, channel, [`Failed to join ${joinChannel}: ${err && err.message ? err.message : err}`])
           .catch(()=>{});
       });
   }
@@ -980,7 +980,7 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `Added admin uid ${uid}`).catch(()=>{});
     }).catch(err => {
       console.error('Error adding admin:', err);
-      queueSend(channel, `Failed to add admin: ${err && err.message ? err.message : err}`).catch(()=>{});
+      sendSplit(client, channel, [`Failed to add admin: ${err && err.message ? err.message : err}`]).catch(()=>{});
     });
   }
 
@@ -1004,7 +1004,7 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `Removed admin uid ${uid}`).catch(()=>{});
     }).catch(err => {
       console.error('Error removing admin:', err);
-      queueSend(channel, `Failed to remove admin: ${err && err.message ? err.message : err}`).catch(()=>{});
+      sendSplit(client, channel, [`Failed to remove admin: ${err && err.message ? err.message : err}`]).catch(()=>{});
     });
   }
 
@@ -1174,6 +1174,23 @@ client.on('message', async (channel, tags, message, self) => {
 
       msgs.push(baseUserMsg);
 
+      // Final token budget check before sending to LLM
+      const totalTokens = estimateMessagesTokens(msgs);
+      const maxAllowed = LLM_CONTEXT_TOKENS - LLM_RESPONSE_TOKEN_BUFFER;
+      if (totalTokens > maxAllowed) {
+        console.warn(`Token budget exceeded: ${totalTokens} > ${maxAllowed}. Trimming history.`);
+        // Remove history messages and rebuild if needed
+        msgs = msgs.filter(m => m.role !== 'system' || !m.content.includes('Recent channel messages'));
+        msgs.push(baseUserMsg);
+        const newTotal = estimateMessagesTokens(msgs);
+        if (newTotal > maxAllowed) {
+          const msg = `Token limit exceeded (${newTotal}/${maxAllowed} tokens). Question too long.`;
+          console.error(msg);
+          sendSplit(client, channel, [msg]).catch(()=>{});
+          return;
+        }
+      }
+
       // Log the entire messages array sent to LLM
       console.log(`LLM REQUEST (${source || 'unknown'}, all prompt/context):`, JSON.stringify(msgs, null, 2));
 
@@ -1181,7 +1198,7 @@ client.on('message', async (channel, tags, message, self) => {
       if (resp.error) {
         console.error('OpenRouter error:', resp.error);
         const msg = formatAIError(resp.error);
-        queueSend(channel, `AI error: ${msg}`).catch(()=>{});
+        sendSplit(client, channel, [`AI error: ${msg}`]).catch(()=>{});
         return;
       }
       const out = (resp.text || '').trim();
@@ -1225,7 +1242,7 @@ client.on('message', async (channel, tags, message, self) => {
       })
       .catch(err => {
         console.error('Error setting prefix:', err);
-        sendAndRecord(channel, `Failed to set prefix: ${err && err.message ? err.message : err}`).catch(()=>{});
+        sendSplit(client, channel, [`Failed to set prefix: ${err && err.message ? err.message : err}`]).catch(()=>{});
       });
   }
 
@@ -1255,7 +1272,7 @@ client.on('message', async (channel, tags, message, self) => {
       })
       .catch(err => {
         console.error('Error setting lockdown:', err);
-        queueSend(channel, `Failed to set lockdown: ${err && err.message ? err.message : err}`).catch(()=>{});
+        sendSplit(client, channel, [`Failed to set lockdown: ${err && err.message ? err.message : err}`]).catch(()=>{});
       });
     return;
   }
@@ -1287,7 +1304,7 @@ client.on('message', async (channel, tags, message, self) => {
       })
       .catch(err => {
         console.error('Error leaving channel:', err);
-        sendAndRecord(channel, `Failed to leave ${leaveChannel}: ${err && err.message ? err.message : err}`)
+        sendSplit(client, channel, [`Failed to leave ${leaveChannel}: ${err && err.message ? err.message : err}`])
           .catch(()=>{});
       });
   }
