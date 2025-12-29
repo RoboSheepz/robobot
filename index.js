@@ -689,9 +689,16 @@ client.on('message', async (channel, tags, message, self) => {
         let response = '';
         let usage = null;
         for await (const chunk of stream) {
-          const content = chunk.choices && chunk.choices[0] && (chunk.choices[0].delta?.content || chunk.choices[0].message?.content || chunk.choices[0].text);
+          let content = null;
+          const choices = chunk && chunk.choices;
+          const first = choices && choices[0];
+          if (first) {
+            if (first.delta && first.delta.content) content = first.delta.content;
+            else if (first.message && first.message.content) content = first.message.content;
+            else if (first.text) content = first.text;
+          }
           if (content) response += content;
-          if (chunk.usage) usage = chunk.usage;
+          if (chunk && chunk.usage) usage = chunk.usage;
         }
 
         return { text: String(response), usage };
