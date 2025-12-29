@@ -99,7 +99,7 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'gpt-4o-mini';
 const OPENROUTER_URL = process.env.OPENROUTER_URL || 'https://api.openrouter.ai/v1/chat/completions';
 // Optional system prompt / extra context to include with every LLM call
-const LLM_SYSTEM_PROMPT = process.env.LLM_SYSTEM_PROMPT || 'You are to play the role of a concise assistant in a Twitch chat. Respond in one sentence or less. Do not use asterisks or special formatting such as bold or italics.';
+const LLM_SYSTEM_PROMPT = process.env.LLM_SYSTEM_PROMPT || 'You are to play the role of a concise assistant in a Twitch chat.';
 // Per-user conversation memory (array of {role, content}) to include previous Q/A
 const userConversations = new Map();
 const USER_CONV_LIMIT = Number(process.env.USER_CONV_LIMIT || 10);
@@ -165,6 +165,78 @@ client.on('message', async (channel, tags, message, self) => {
   } catch (e) {
     console.error('Failed updating recentUsers:', e);
   }
+
+    // If the first word mentions the bot by username, call the `ask` command.
+    try {
+      const botName = String(process.env.TWITCH_USERNAME || opts.identity.username || '').toLowerCase();
+      if (botName) {
+        const words = msg.split(/\s+/);
+        if (words.length > 1) {
+          let first = words[0] || '';
+          if (first.startsWith('@')) first = first.slice(1);
+          // strip trailing punctuation , . ; :
+          first = first.replace(/[\,\.\;\:]+$/g, '');
+          if (first.toLowerCase() === botName) {
+            const remainder = words.slice(1).join(' ').trim();
+            if (remainder) {
+              // parse optional model flag
+              const parsed = extractModelFlag(remainder);
+              const prompt = (parsed.rest || '').trim();
+              const modelOverride = parsed.model || null;
+              if (prompt) {
+                console.log(`[${time}] Direct mention LLM request from ${username}: ${prompt.slice(0,200)}`);
+                // Build messages similar to askchat handler
+                const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+                const msgs = [];
+                if (LLM_SYSTEM_PROMPT) msgs.push({ role: 'system', content: LLM_SYSTEM_PROMPT });
+                const conv = userConversations.get(userKey) || [];
+                for (const m of conv) msgs.push(m);
+                const hist = channelChatHistory.get(channelKey) || [];
+                if (hist && hist.length) {
+                  let acc = '';
+                  for (let i = hist.length - 1; i >= 0; i--) {
+                    const entry = hist[i];
+                    const line = `${entry.user}: ${entry.text}\n`;
+                    if ((acc.length + line.length) > CHAT_HISTORY_MAX_CHARS) break;
+                    acc = line + acc;
+                  }
+                  if (acc) msgs.push({ role: 'system', content: `Recent channel messages:\n${acc}` });
+                }
+                msgs.push({ role: 'user', content: prompt });
+                try {
+                  const resp = await callOpenRouter(msgs, modelOverride);
+                  if (resp && resp.error) {
+                    console.error('OpenRouter error (mention):', resp.error);
+                    queueSend(channel, `AI error: ${resp.error}`).catch(()=>{});
+                  } else {
+                    const out = (resp.text || '').trim();
+                    if (!out) {
+                      queueSend(channel, `AI returned no text`).catch(()=>{});
+                    } else {
+                      // append to per-user conversation memory
+                      try {
+                        const convArr = userConversations.get(userKey) || [];
+                        convArr.push({ role: 'user', content: prompt });
+                        convArr.push({ role: 'assistant', content: out });
+                        while (convArr.length > USER_CONV_LIMIT) convArr.shift();
+                        userConversations.set(userKey, convArr);
+                      } catch (e) { console.error('Failed updating userConversations:', e); }
+                      await sendSplit(client, channel, [out]);
+                    }
+                  }
+                } catch (e) {
+                  console.error('ask (mention) error:', e);
+                  queueSend(channel, `AI request failed`).catch(()=>{});
+                }
+              }
+              return;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Bot mention detection error:', e);
+    }
 
   // Only treat messages that start with the configured prefix as commands
   if (!msg.startsWith(prefix)) return;
@@ -562,8 +634,7 @@ client.on('message', async (channel, tags, message, self) => {
     cmdLines.push(`${pfx}addadmin <uid/user> - Add a user as admin (${effectiveAuth('addadmin')})`);
     cmdLines.push(`${pfx}rmadmin <uid/user> - Remove a user from admins (${effectiveAuth('rmadmin')})`);
     cmdLines.push(`${pfx}massping - send single message of recent users (${effectiveAuth('massping')})`);
-    cmdLines.push(`${pfx}ask [--model MODEL] <question> - ask the LLM (${effectiveAuth('ask')})`);
-    cmdLines.push(`${pfx}askchat [--model MODEL] <question> - ask with recent channel chat as context (${effectiveAuth('askchat')})`);
+    cmdLines.push(`${pfx}ask [--model MODEL] <question> - ask with recent channel chat as context (${effectiveAuth('ask')})`);
     cmdLines.push(`${pfx}askclear [username|uid] - clear your (or admin: another user's) AI conversation memory (${effectiveAuth('askclear')})`);
     cmdLines.push(`${pfx}lockdown [on|off|toggle] - restrict all bot commands to admins in this channel (${effectiveAuth('lockdown')})`);
     sendSplit(client, channel, cmdLines).catch(err => console.error('Help send error:', err));
@@ -591,7 +662,9 @@ client.on('message', async (channel, tags, message, self) => {
     sendSplit(client, channel, [`Username: ${info.login}`, `Display: ${info.display_name}`, `UID: ${info.id}`, `Created: ${info.created_at}`, `Status: ${status}`]).catch(()=>{});
   }
 
-  // Ask LLM via OpenRouter: <prefix>ask <prompt>
+  
+
+  // Ask LLM including recent channel chat history as context: <prefix>ask <prompt>
   if (command === 'ask' || command === 'ai') {
     const raw = withoutPrefix.slice(command.length).trim();
     const parsed = extractModelFlag(raw);
@@ -599,59 +672,6 @@ client.on('message', async (channel, tags, message, self) => {
     const modelOverride = parsed.model || null;
     if (!prompt) {
       queueSend(channel, `Usage: ${prefix}ask [--model MODEL] <your question>`).catch(()=>{});
-      return;
-    }
-    // optional: log
-    console.log(`[${time}] LLM request from ${username}: ${prompt.slice(0,200)}`);
-    console.log(`[${time}] Model override: ${modelOverride || 'none'}`);
-    try {
-      // Build messages including optional system prompt and per-user conversation memory
-      const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
-      const msgs = [];
-      if (LLM_SYSTEM_PROMPT) msgs.push({ role: 'system', content: LLM_SYSTEM_PROMPT });
-      const conv = userConversations.get(userKey) || [];
-      for (const m of conv) msgs.push(m);
-      msgs.push({ role: 'user', content: prompt });
-
-      const resp = await callOpenRouter(msgs, modelOverride);
-      if (resp.error) {
-        console.error('OpenRouter error:', resp.error);
-        queueSend(channel, `AI error: ${resp.error}`).catch(()=>{});
-        return;
-      }
-      const out = (resp.text || '').trim();
-      if (!out) {
-        queueSend(channel, `AI returned no text`).catch(()=>{});
-        return;
-      }
-      // append to per-user conversation memory (user then assistant)
-      try {
-        const convArr = userConversations.get(userKey) || [];
-        convArr.push({ role: 'user', content: prompt });
-        convArr.push({ role: 'assistant', content: out });
-        // trim oldest entries to USER_CONV_LIMIT
-        while (convArr.length > USER_CONV_LIMIT) convArr.shift();
-        userConversations.set(userKey, convArr);
-      } catch (e) {
-        console.error('Failed updating userConversations:', e);
-      }
-      // send split to respect chat length limits
-      await sendSplit(client, channel, [out]);
-    } catch (e) {
-      console.error('ask command error:', e);
-      queueSend(channel, `AI request failed`).catch(()=>{});
-    }
-    return;
-  }
-
-  // Ask LLM including recent channel chat history as context: <prefix>askchat <prompt>
-  if (command === 'askchat') {
-    const raw = withoutPrefix.slice(command.length).trim();
-    const parsed = extractModelFlag(raw);
-    const prompt = (parsed.rest || '').trim();
-    const modelOverride = parsed.model || null;
-    if (!prompt) {
-      queueSend(channel, `Usage: ${prefix}askchat [--model MODEL] <your question>`).catch(()=>{});
       return;
     }
     console.log(`[${time}] askchat from ${username}: ${prompt.slice(0,200)}`);
