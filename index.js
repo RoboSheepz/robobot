@@ -422,6 +422,15 @@ client.on('message', async (channel, tags, message, self) => {
                 // Silently ignore banned users
                 return;
               }
+              // Check if channel has lockdown enabled
+              const mentionChanCfg = channelsCache.get(channelKey) || { prefix: '!', require_admin: false };
+              if (mentionChanCfg && mentionChanCfg.require_admin) {
+                const mentionIsAdmin = adminsCache.has(mentionUserId);
+                if (!mentionIsAdmin) {
+                  // Silently ignore non-admins when channel is locked down
+                  return;
+                }
+              }
               // parse optional model flag
               const parsed = extractModelFlag(remainder);
               const prompt = (parsed.rest || '').trim();
@@ -475,6 +484,16 @@ client.on('message', async (channel, tags, message, self) => {
     }
   } catch (e) {
     console.error('Banned user check error:', e);
+  }
+
+  // Enforce per-channel admin requirement: if channel requires admin for all commands, block non-admins
+  try {
+    if (chanCfg && chanCfg.require_admin && !isAdmin) {
+      console.log(`[${time}] Channel ${channelKey} requires admin for all commands; rejecting ${username} for '${command}'`);
+      return;
+    }
+  } catch (e) {
+    console.error('Channel auth enforcement error:', e);
   }
 
   // Enforce per-user, per-command cooldown
@@ -613,16 +632,6 @@ client.on('message', async (channel, tags, message, self) => {
       sendSplit(client, channel, [`Failed to add character: ${e && e.message ? e.message : 'error'}`]).catch(()=>{});
     }
     return;
-  }
-
-  // Enforce per-channel admin requirement: if channel requires admin for all commands, block non-admins
-  try {
-    if (chanCfg && chanCfg.require_admin && !isAdmin) {
-      console.log(`[${time}] Channel ${channelKey} requires admin for all commands; rejecting ${username} for '${command}'`);
-      return;
-    }
-  } catch (e) {
-    console.error('Channel auth enforcement error:', e);
   }
 
   // Helper: fetch user info from Helix by login or id. Returns parsed user obj or null.
