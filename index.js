@@ -94,13 +94,27 @@ let adminsCache = new Set();
 let channelsCache = new Map();
 let helixClientId = null;
 
+// OpenRouter LLM configuration
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'gpt-4o-mini';
+const OPENROUTER_URL = process.env.OPENROUTER_URL || 'https://api.openrouter.ai/v1/chat/completions';
+// Optional system prompt / extra context to include with every LLM call
+const LLM_SYSTEM_PROMPT = process.env.LLM_SYSTEM_PROMPT || 'You are to play the role of a concise assistant in a Twitch chat. Respond in one sentence or less. Do not use asterisks or special formatting such as bold or italics.';
+// Per-user conversation memory (array of {role, content}) to include previous Q/A
+const userConversations = new Map();
+const USER_CONV_LIMIT = Number(process.env.USER_CONV_LIMIT || 10);
+// Per-channel chat history (array of {user, text, ts}); used by askchat
+const channelChatHistory = new Map();
+const CHAT_HISTORY_LIMIT = Number(process.env.CHAT_HISTORY_LIMIT || 200); // messages
+const CHAT_HISTORY_MAX_CHARS = Number(process.env.CHAT_HISTORY_MAX_CHARS || 4000);
+
 // token validation moved to `troubleshoot.js` (imported above)
 
 client.on('message', async (channel, tags, message, self) => {
   // Always log inbound messages for debugging
   const time = new Date().toISOString();
   const username = tags['display-name'] || tags.username;
-  console.log(`[${time}] ${channel} <${username}>: ${message} (self=${self})`);
+  // console.log(`[${time}] ${channel} <${username}>: ${message} (self=${self})`);
   
 
   // If this message is an echo of our own outgoing message, ignore it to avoid loops.
@@ -138,6 +152,15 @@ client.on('message', async (channel, tags, message, self) => {
       arr.unshift(login);
       if (arr.length > 100) arr.length = 100;
       recentUsers.set(channelKey, arr);
+      // record chat message for channel history (skip bot accounts)
+      try {
+        const hist = channelChatHistory.get(channelKey) || [];
+        hist.push({ user: login, text: String(message || ''), ts: Date.now() });
+        if (hist.length > CHAT_HISTORY_LIMIT) hist.splice(0, hist.length - CHAT_HISTORY_LIMIT);
+        channelChatHistory.set(channelKey, hist);
+      } catch (e) {
+        console.error('Failed updating channelChatHistory:', e);
+      }
     }
   } catch (e) {
     console.error('Failed updating recentUsers:', e);
@@ -215,6 +238,42 @@ client.on('message', async (channel, tags, message, self) => {
     });
   }
 
+  // Helper: call OpenRouter using the official SDK and stream results
+  // callOpenRouter accepts either a prompt string or an array of messages [{role,content},...]
+  // and an optional model override string as second argument
+  async function callOpenRouter(input, modelOverride) {
+    if (!OPENROUTER_API_KEY) return { error: 'No OPENROUTER_API_KEY configured' };
+    let OpenRouter;
+    try {
+      OpenRouter = require('@openrouter/sdk').OpenRouter;
+    } catch (e) {
+      return { error: 'Missing @openrouter/sdk. Install with: npm install @openrouter/sdk' };
+    }
+
+    try {
+      const or = new OpenRouter({ apiKey: OPENROUTER_API_KEY });
+      const messages = Array.isArray(input) ? input.map(m => ({ role: m.role, content: String(m.content) })) : [{ role: 'user', content: String(input) }];
+      const stream = await or.chat.send({
+        model: modelOverride || OPENROUTER_MODEL,
+        messages,
+        stream: true,
+        streamOptions: { includeUsage: true }
+      });
+
+      let response = '';
+      let usage = null;
+      for await (const chunk of stream) {
+        const content = chunk.choices && chunk.choices[0] && (chunk.choices[0].delta?.content || chunk.choices[0].message?.content || chunk.choices[0].text);
+        if (content) response += content;
+        if (chunk.usage) usage = chunk.usage;
+      }
+
+      return { text: String(response), usage };
+    } catch (err) {
+      return { error: err && err.message ? err.message : String(err) };
+    }
+  }
+
   // Helper: collect system statistics (cpu %, memory usage, uptime, os info)
   async function getSystemStats() {
     function cpuTimes() {
@@ -276,7 +335,7 @@ client.on('message', async (channel, tags, message, self) => {
 
   // Helper to send multi-part messages limited to 200 chars each
   function sendSplit(client, channel, lines) {
-    const max = 200;
+    const max = 152;
     const chunks = [];
     // build chunks first
     for (const line of lines) {
@@ -329,6 +388,21 @@ client.on('message', async (channel, tags, message, self) => {
     return { token: m[1], rest: (m[2] || '').trim() };
   }
 
+
+    // Helper: extract a leading --model flag from a prompt string.
+    // Returns { model: string|null, rest: string }
+    function extractModelFlag(s) {
+      if (!s) return { model: null, rest: '' };
+      const str = String(s).trim();
+      if (!str) return { model: null, rest: '' };
+      // Patterns: --model=value, --model "value", --model 'value', --model value
+      // Also support short form: -m=value or -m "value" or -m value
+      let m = str.match(/^(?:--model|-m)=(?:"([^"]+)"|'([^']+)'|([^\s]+))(?:\s+([\s\S]*))?$/);
+      if (m) return { model: m[1] || m[2] || m[3] || null, rest: (m[4] || '').trim() };
+      m = str.match(/^(?:--model|-m)\s+(?:"([^"]+)"|'([^']+)'|([^\s]+))(?:\s+([\s\S]*))?$/);
+      if (m) return { model: m[1] || m[2] || m[3] || null, rest: (m[4] || '').trim() };
+      return { model: null, rest: str };
+    }
   // sendAndRecord is defined at module top-level to be available to the send queue
 
   if (command === 'ping') {
@@ -471,7 +545,11 @@ client.on('message', async (channel, tags, message, self) => {
       leave: 'admin',
       addadmin: 'admin',
       rmadmin: 'admin',
-      massping: 'admin'
+      massping: 'admin',
+      ask: 'user',
+      askchat: 'user',
+      askclear: 'user',
+      lockdown: 'admin'
     };
     // if channel enforces admin for all commands, override default
     const effectiveAuth = (cmd) => (chanCfg && chanCfg.require_admin) ? 'admin' : (defaultAuth[cmd] || 'user');
@@ -484,6 +562,10 @@ client.on('message', async (channel, tags, message, self) => {
     cmdLines.push(`${pfx}addadmin <uid/user> - Add a user as admin (${effectiveAuth('addadmin')})`);
     cmdLines.push(`${pfx}rmadmin <uid/user> - Remove a user from admins (${effectiveAuth('rmadmin')})`);
     cmdLines.push(`${pfx}massping - send single message of recent users (${effectiveAuth('massping')})`);
+    cmdLines.push(`${pfx}ask [--model MODEL] <question> - ask the LLM (${effectiveAuth('ask')})`);
+    cmdLines.push(`${pfx}askchat [--model MODEL] <question> - ask with recent channel chat as context (${effectiveAuth('askchat')})`);
+    cmdLines.push(`${pfx}askclear [username|uid] - clear your (or admin: another user's) AI conversation memory (${effectiveAuth('askclear')})`);
+    cmdLines.push(`${pfx}lockdown [on|off|toggle] - restrict all bot commands to admins in this channel (${effectiveAuth('lockdown')})`);
     sendSplit(client, channel, cmdLines).catch(err => console.error('Help send error:', err));
   }
 
@@ -507,6 +589,169 @@ client.on('message', async (channel, tags, message, self) => {
     // Attempt to detect ban status: Helix doesn't expose global ban easily; if user exists, report active
     const status = 'active';
     sendSplit(client, channel, [`Username: ${info.login}`, `Display: ${info.display_name}`, `UID: ${info.id}`, `Created: ${info.created_at}`, `Status: ${status}`]).catch(()=>{});
+  }
+
+  // Ask LLM via OpenRouter: <prefix>ask <prompt>
+  if (command === 'ask' || command === 'ai') {
+    const raw = withoutPrefix.slice(command.length).trim();
+    const parsed = extractModelFlag(raw);
+    const prompt = (parsed.rest || '').trim();
+    const modelOverride = parsed.model || null;
+    if (!prompt) {
+      queueSend(channel, `Usage: ${prefix}ask [--model MODEL] <your question>`).catch(()=>{});
+      return;
+    }
+    // optional: log
+    console.log(`[${time}] LLM request from ${username}: ${prompt.slice(0,200)}`);
+    console.log(`[${time}] Model override: ${modelOverride || 'none'}`);
+    try {
+      // Build messages including optional system prompt and per-user conversation memory
+      const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+      const msgs = [];
+      if (LLM_SYSTEM_PROMPT) msgs.push({ role: 'system', content: LLM_SYSTEM_PROMPT });
+      const conv = userConversations.get(userKey) || [];
+      for (const m of conv) msgs.push(m);
+      msgs.push({ role: 'user', content: prompt });
+
+      const resp = await callOpenRouter(msgs, modelOverride);
+      if (resp.error) {
+        console.error('OpenRouter error:', resp.error);
+        queueSend(channel, `AI error: ${resp.error}`).catch(()=>{});
+        return;
+      }
+      const out = (resp.text || '').trim();
+      if (!out) {
+        queueSend(channel, `AI returned no text`).catch(()=>{});
+        return;
+      }
+      // append to per-user conversation memory (user then assistant)
+      try {
+        const convArr = userConversations.get(userKey) || [];
+        convArr.push({ role: 'user', content: prompt });
+        convArr.push({ role: 'assistant', content: out });
+        // trim oldest entries to USER_CONV_LIMIT
+        while (convArr.length > USER_CONV_LIMIT) convArr.shift();
+        userConversations.set(userKey, convArr);
+      } catch (e) {
+        console.error('Failed updating userConversations:', e);
+      }
+      // send split to respect chat length limits
+      await sendSplit(client, channel, [out]);
+    } catch (e) {
+      console.error('ask command error:', e);
+      queueSend(channel, `AI request failed`).catch(()=>{});
+    }
+    return;
+  }
+
+  // Ask LLM including recent channel chat history as context: <prefix>askchat <prompt>
+  if (command === 'askchat') {
+    const raw = withoutPrefix.slice(command.length).trim();
+    const parsed = extractModelFlag(raw);
+    const prompt = (parsed.rest || '').trim();
+    const modelOverride = parsed.model || null;
+    if (!prompt) {
+      queueSend(channel, `Usage: ${prefix}askchat [--model MODEL] <your question>`).catch(()=>{});
+      return;
+    }
+    console.log(`[${time}] askchat from ${username}: ${prompt.slice(0,200)}`);
+    try {
+      const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+      const msgs = [];
+      if (LLM_SYSTEM_PROMPT) msgs.push({ role: 'system', content: LLM_SYSTEM_PROMPT });
+
+      // include per-user conv first
+      const conv = userConversations.get(userKey) || [];
+      for (const m of conv) msgs.push(m);
+
+      // compose recent channel chat history (most recent messages up to char cap)
+      const hist = channelChatHistory.get(channelKey) || [];
+      if (hist && hist.length) {
+        let acc = '';
+        // iterate from most recent backwards and build up to max chars
+        for (let i = hist.length - 1; i >= 0; i--) {
+          const entry = hist[i];
+          const line = `${entry.user}: ${entry.text}\n`;
+          if ((acc.length + line.length) > CHAT_HISTORY_MAX_CHARS) break;
+          acc = line + acc; // keep chronological order
+        }
+        if (acc) msgs.push({ role: 'system', content: `Recent channel messages:\n${acc}` });
+      }
+
+      msgs.push({ role: 'user', content: prompt });
+
+      const resp = await callOpenRouter(msgs, modelOverride);
+      if (resp.error) {
+        console.error('OpenRouter error:', resp.error);
+        queueSend(channel, `AI error: ${resp.error}`).catch(()=>{});
+        return;
+      }
+      const out = (resp.text || '').trim();
+      if (!out) {
+        queueSend(channel, `AI returned no text`).catch(()=>{});
+        return;
+      }
+      // append to per-user conversation memory
+      try {
+        const convArr = userConversations.get(userKey) || [];
+        convArr.push({ role: 'user', content: prompt });
+        convArr.push({ role: 'assistant', content: out });
+        while (convArr.length > USER_CONV_LIMIT) convArr.shift();
+        userConversations.set(userKey, convArr);
+      } catch (e) { console.error('Failed updating userConversations:', e); }
+
+      await sendSplit(client, channel, [out]);
+    } catch (e) {
+      console.error('askchat command error:', e);
+      queueSend(channel, `AI request failed`).catch(()=>{});
+    }
+    return;
+  }
+
+  // Clear conversation memory: askclear [username|uid]
+  if (command === 'askclear') {
+    const raw = withoutPrefix.slice(command.length).trim();
+    const first = extractFirstTokenPreservingQuotes(raw || '');
+    const target = first.token || null;
+    // If no target provided, allow user to clear their own memory
+    const callerKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+    if (!target) {
+      userConversations.delete(callerKey);
+      queueSend(channel, `Cleared your conversation memory.`).catch(()=>{});
+      return;
+    }
+    // target provided -> must be admin to clear others
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to clear another user's memory.`).catch(()=>{});
+      return;
+    }
+    try {
+      // if numeric, treat as uid
+      if (/^\d+$/.test(target)) {
+        userConversations.delete(String(target));
+        queueSend(channel, `Cleared conversation memory for uid ${target}`).catch(()=>{});
+        return;
+      }
+      // try resolving to uid
+      const uid = await resolveToUid(target);
+      if (uid) {
+        userConversations.delete(String(uid));
+        queueSend(channel, `Cleared conversation memory for ${target} (uid ${uid})`).catch(()=>{});
+        return;
+      }
+      // fallback: remove by username key
+      const uname = String(target).toLowerCase();
+      if (userConversations.has(uname)) {
+        userConversations.delete(uname);
+        queueSend(channel, `Cleared conversation memory for ${target}`).catch(()=>{});
+        return;
+      }
+      queueSend(channel, `No conversation memory found for '${target}'`).catch(()=>{});
+    } catch (e) {
+      console.error('askclear error:', e);
+      queueSend(channel, `Failed to clear conversation memory for '${target}'`).catch(()=>{});
+    }
+    return;
   }
 
   // Admin-only: massping - send a single (<=500 char) message listing most recent usernames for this channel
@@ -571,6 +816,37 @@ client.on('message', async (channel, tags, message, self) => {
         console.error('Error setting prefix:', err);
         sendAndRecord(channel, `Failed to set prefix: ${err && err.message ? err.message : err}`).catch(()=>{});
       });
+  }
+
+  // Admin-only: lockdown - restrict all bot commands to admins in this channel
+  // Usage: <prefix>lockdown [on|off|toggle]
+  if (command === 'lockdown') {
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    const arg = (parts[1] || 'toggle').toLowerCase();
+    const normalized = channelKey;
+    const existing = channelsCache.get(normalized) || { prefix: prefix, require_admin: false };
+    let newRequire;
+    if (['on', 'enable', 'true', '1'].includes(arg)) newRequire = true;
+    else if (['off', 'disable', 'false', '0'].includes(arg)) newRequire = false;
+    else if (arg === 'toggle') newRequire = !existing.require_admin;
+    else {
+      queueSend(channel, `Usage: ${prefix}lockdown [on|off|toggle]`).catch(()=>{});
+      return;
+    }
+
+    db.addChannel(normalized, existing.prefix || prefix, newRequire)
+      .then(() => {
+        channelsCache.set(normalized, { prefix: existing.prefix || prefix, require_admin: newRequire });
+        queueSend(channel, `Lockdown ${newRequire ? 'enabled' : 'disabled'} for #${normalized}`).catch(()=>{});
+      })
+      .catch(err => {
+        console.error('Error setting lockdown:', err);
+        queueSend(channel, `Failed to set lockdown: ${err && err.message ? err.message : err}`).catch(()=>{});
+      });
+    return;
   }
 
   // Admin-only: leave a channel
