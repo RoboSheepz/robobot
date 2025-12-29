@@ -1052,7 +1052,7 @@ client.on('message', async (channel, tags, message, self) => {
     cmdLines.push(`${pfx}massping - send single message of recent users (${effectiveAuth('massping')})`);
     cmdLines.push(`${pfx}ask [--model MODEL] <question> - ask with recent channel chat as context (${effectiveAuth('ask')})`);
     cmdLines.push(`${pfx}askclear [username|uid] - clear your (or admin: another user's) AI conversation memory (${effectiveAuth('askclear')})`);
-    cmdLines.push(`${pfx}lockdown [on|off|toggle] - restrict all bot commands to admins in this channel (${effectiveAuth('lockdown')})`);
+    cmdLines.push(`${pfx}lockdown [on|off|toggle] [--channel <ch>|-c <ch>] [--all|-a] - restrict commands to admins (${effectiveAuth('lockdown')})`);
     cmdLines.push(`${pfx}ban <username|uid> - Ban user from all bot commands (admin)`);
     cmdLines.push(`${pfx}unban <username|uid> - Unban user (admin)`);
     cmdLines.push(`${pfx}say [--channel <channel>] <message> - Make the bot say something (admin)`);
@@ -1280,28 +1280,81 @@ client.on('message', async (channel, tags, message, self) => {
   }
 
   // Admin-only: lockdown - restrict all bot commands to admins in this channel
-  // Usage: <prefix>lockdown [on|off|toggle]
+  // Usage: <prefix>lockdown [on|off|toggle] [--channel <channel>|-c <channel>] [--all|-a]
   if (command === 'lockdown') {
     if (!isAdmin) {
       queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
-    const arg = (parts[1] || 'toggle').toLowerCase();
-    const normalized = channelKey;
-    const existing = channelsCache.get(normalized) || { prefix: prefix, require_admin: false };
-    let newRequire;
-    if (['on', 'enable', 'true', '1'].includes(arg)) newRequire = true;
-    else if (['off', 'disable', 'false', '0'].includes(arg)) newRequire = false;
-    else if (arg === 'toggle') newRequire = !existing.require_admin;
-    else {
-      queueSend(channel, `Usage: ${prefix}lockdown [on|off|toggle]`).catch(()=>{});
+    const raw = withoutPrefix.slice(command.length).trim();
+    const parts2 = raw.split(/\s+/);
+    
+    // Parse state (on/off/toggle)
+    let stateArg = 'toggle';
+    let channelTarget = null;
+    let applyToAll = false;
+    
+    for (let i = 0; i < parts2.length; i++) {
+      const p = parts2[i].toLowerCase();
+      if (p === '--all' || p === '-a') {
+        applyToAll = true;
+      } else if (p === '--channel' || p === '-c') {
+        if (i + 1 < parts2.length) {
+          channelTarget = parts2[i + 1];
+          i++;
+        }
+      } else if (['on', 'off', 'toggle', 'enable', 'disable', 'true', 'false', '0', '1'].includes(p)) {
+        stateArg = p;
+      }
+    }
+
+    // Determine target channels
+    let targetChannels = [];
+    if (applyToAll) {
+      targetChannels = Array.from(channelsCache.keys());
+    } else if (channelTarget) {
+      const normalized = channelTarget.startsWith('#') ? channelTarget.slice(1) : channelTarget;
+      targetChannels = [normalized];
+    } else {
+      targetChannels = [channelKey];
+    }
+
+    if (!targetChannels.length) {
+      queueSend(channel, `No channels to update.`).catch(()=>{});
       return;
     }
 
-    db.addChannel(normalized, existing.prefix || prefix, newRequire)
+    // Apply lockdown to all target channels
+    const updates = targetChannels.map(async (ch) => {
+      const existing = channelsCache.get(ch) || { prefix: prefix, require_admin: false };
+      let newRequire;
+      if (['on', 'enable', 'true', '1'].includes(stateArg)) newRequire = true;
+      else if (['off', 'disable', 'false', '0'].includes(stateArg)) newRequire = false;
+      else if (stateArg === 'toggle') newRequire = !existing.require_admin;
+      
+      try {
+        await db.addChannel(ch, existing.prefix || prefix, newRequire);
+        channelsCache.set(ch, { prefix: existing.prefix || prefix, require_admin: newRequire });
+      } catch (err) {
+        console.error(`Error setting lockdown for ${ch}:`, err);
+        throw err;
+      }
+    });
+
+    Promise.all(updates)
       .then(() => {
-        channelsCache.set(normalized, { prefix: existing.prefix || prefix, require_admin: newRequire });
-        queueSend(channel, `Lockdown ${newRequire ? 'enabled' : 'disabled'} for #${normalized}`).catch(()=>{});
+        if (applyToAll) {
+          const status = targetChannels.some(ch => {
+            const cfg = channelsCache.get(ch);
+            return cfg && cfg.require_admin;
+          }) ? 'enabled' : 'disabled';
+          queueSend(channel, `Lockdown ${status} for all channels.`).catch(()=>{});
+        } else {
+          const normalized = targetChannels[0];
+          const cfg = channelsCache.get(normalized);
+          const status = cfg && cfg.require_admin ? 'enabled' : 'disabled';
+          queueSend(channel, `Lockdown ${status} for #${normalized}`).catch(()=>{});
+        }
       })
       .catch(err => {
         console.error('Error setting lockdown:', err);
