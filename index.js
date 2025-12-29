@@ -458,8 +458,8 @@ client.on('message', async (channel, tags, message, self) => {
       console.error('Bot mention detection error:', e);
     }
 
-  // Helper command as required by pajlada Bot guidelines
-  if (msg.startsWith(`!${process.env.TWITCH_USERNAME}`)) {
+  // Helper command with ! as required by pajlada Bot guidelines
+  if (msg.toLowerCase().startsWith(`!${process.env.TWITCH_USERNAME.toLowerCase()}`)) {
     queueSend(channel, `Hi I'm a lidl clank-slop bot by @RoboSheepz. Ping me at the beginning of your message to chat or ${prefix}help for more.`).catch(()=>{});
   }
 
