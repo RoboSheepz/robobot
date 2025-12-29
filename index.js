@@ -4,8 +4,68 @@ const { validateToken, attachDebug, sendAndLog } = require('./troubleshoot');
 const db = require('./db');
 const https = require('https');
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
 // Global message queue settings
 const MESSAGE_INTERVAL_MS = Number(process.env.MESSAGE_INTERVAL_MS || 1100);
+
+// Banphrase API configuration
+const BANPHRASE_API_URL = process.env.BANPHRASE_API_URL || 'https://pajlada.pajbot.com/api/v1/banphrases/test';
+
+// Helper function to check message against banphrase API
+async function checkBanphrase(message) {
+  return new Promise((resolve) => {
+    try {
+      const postData = JSON.stringify({ message: String(message) });
+      const url = new URL(BANPHRASE_API_URL);
+      
+      const options = {
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: url.pathname + url.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData)
+        },
+        timeout: 3000
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => data += chunk);
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data || '{}');
+            // API returns { banned: true/false, ... }
+            resolve({ banned: !!parsed.banned, response: parsed });
+          } catch (e) {
+            console.error('Banphrase API parse error:', e);
+            resolve({ banned: false, error: e });
+          }
+        });
+      });
+
+      req.on('error', (err) => {
+        console.error('Banphrase API request error:', err);
+        resolve({ banned: false, error: err });
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        console.error('Banphrase API timeout');
+        resolve({ banned: false, error: new Error('timeout') });
+      });
+
+      req.write(postData);
+      req.end();
+    } catch (e) {
+      console.error('Banphrase check error:', e);
+      resolve({ banned: false, error: e });
+    }
+  });
+}
 
 // Global send queue
 const sendQueue = [];
@@ -37,15 +97,24 @@ async function processSendQueue() {
   while (sendQueue.length) {
     const item = sendQueue.shift();
     try {
+      // Check message against banphrase API
+      const banResult = await checkBanphrase(item.text);
+      let messageToSend = item.text;
+      
+      if (banResult.banned) {
+        console.log(`Message blocked by banphrase API: "${item.text}"`);
+        messageToSend = '[banphrased]';
+      }
+      
       // record outgoing message immediately so echoes can be detected
       const now = Date.now();
-      lastOutgoing = String(item.text);
+      lastOutgoing = String(messageToSend);
       lastOutgoingTs = now;
-      recentOutgoing.set(String(item.text), now);
+      recentOutgoing.set(String(messageToSend), now);
       for (const [k, ts] of recentOutgoing) {
         if ((now - ts) > 60000) recentOutgoing.delete(k);
       }
-      await sendAndLog(client, item.channel, item.text);
+      await sendAndLog(client, item.channel, messageToSend);
       item.resolve();
     } catch (err) {
       item.reject(err);
@@ -94,19 +163,182 @@ let adminsCache = new Set();
 let channelsCache = new Map();
 let helixClientId = null;
 
+// In-memory set of banned user IDs (populated from DB at startup)
+let bannedUsersCache = new Set();
+// Ban/unban helpers (DB and cache)
+async function banUser(uid) {
+  if (!uid) return;
+  try {
+    await db.addBannedUser(uid);
+    bannedUsersCache.add(String(uid));
+  } catch (e) {
+    console.error('Failed to ban user:', e);
+  }
+}
+
+async function unbanUser(uid) {
+  if (!uid) return;
+  try {
+    await db.removeBannedUser(uid);
+    bannedUsersCache.delete(String(uid));
+  } catch (e) {
+    console.error('Failed to unban user:', e);
+  }
+}
+
 // OpenRouter LLM configuration
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'gpt-4o-mini';
 const OPENROUTER_URL = process.env.OPENROUTER_URL || 'https://api.openrouter.ai/v1/chat/completions';
 // Optional system prompt / extra context to include with every LLM call
-const LLM_SYSTEM_PROMPT = process.env.LLM_SYSTEM_PROMPT || 'You are to play the role of a concise assistant in a Twitch chat.';
+let LLM_SYSTEM_PROMPT = process.env.LLM_SYSTEM_PROMPT || 'You are to play the role of a concise assistant in a Twitch chat.'; // CHANGED: let
+// Optional character card (JanitorAI PNG format)
+let LLM_CHARACTER_CARD = process.env.LLM_CHARACTER_CARD || null; // CHANGED: let
+let characterCardData = null;
+// LLM context budgeting (tokens)
+const LLM_CONTEXT_TOKENS = Number(process.env.LLM_CONTEXT_TOKENS || 8192);
+const LLM_RESPONSE_TOKEN_BUFFER = Number(process.env.LLM_RESPONSE_TOKEN_BUFFER || 8192);
+
+// Token estimation helpers (tries tiktoken; falls back to chars/4)
+let tkEncoder = null;
+function tryInitTokenizer() {
+  if (tkEncoder !== null) return;
+  try {
+    // Lazy load tokenizer if available
+    const { encoding_for_model } = require('@dqbd/tiktoken');
+    // Use cl100k_base-compatible model name for approximation
+    tkEncoder = encoding_for_model('gpt-4o-mini');
+  } catch (e) {
+    tkEncoder = false; // mark unavailable
+  }
+}
+
+function estimateTokensForText(text) {
+  const s = String(text || '');
+  if (!s) return 0;
+  tryInitTokenizer();
+  try {
+    if (tkEncoder) {
+      const tokens = tkEncoder.encode(s);
+      return tokens.length;
+    }
+  } catch (_) {}
+  // Fallback heuristic: ~4 chars per token
+  return Math.ceil(s.length / 4);
+}
+
+function estimateMessagesTokens(messages) {
+  if (!Array.isArray(messages)) return 0;
+  let total = 0;
+  for (const m of messages) {
+    total += estimateTokensForText(m && m.content ? m.content : '');
+    // add small overhead per message for roles/formatting
+    total += 4;
+  }
+  return total;
+}
+
+// Helper function to extract character data from PNG file (JanitorAI format)
+function loadCharacterCard(filePath) {
+  try {
+    if (!filePath) return null;
+    const fullPath = path.isAbsolute(filePath) ? filePath : path.join(__dirname, filePath);
+    if (!fs.existsSync(fullPath)) {
+      console.warn(`Character card file not found: ${fullPath}`);
+      return null;
+    }
+    const buffer = fs.readFileSync(fullPath);
+    // PNG files start with specific signature
+    if (buffer.length < 8 || buffer.toString('hex', 0, 8) !== '89504e470d0a1a0a') {
+      console.warn('Invalid PNG file format for character card');
+      return null;
+    }
+    // Parse PNG chunks to find tEXt/zTXt chunks containing character data
+    let offset = 8; // Skip PNG signature
+    while (offset < buffer.length) {
+      if (offset + 8 > buffer.length) break;
+      const chunkLength = buffer.readUInt32BE(offset);
+      const chunkType = buffer.toString('ascii', offset + 4, offset + 8);
+      offset += 8;
+      if (offset + chunkLength > buffer.length) break;
+      // Look for tEXt chunk with 'chara' key (common in character cards)
+      if (chunkType === 'tEXt') {
+        const chunkData = buffer.slice(offset, offset + chunkLength);
+        const nullIndex = chunkData.indexOf(0);
+        if (nullIndex !== -1) {
+          const keyword = chunkData.toString('latin1', 0, nullIndex);
+          if (keyword === 'chara' || keyword === 'character' || keyword === 'card') {
+            const textData = chunkData.toString('utf8', nullIndex + 1);
+            try {
+              // Try to parse as base64-encoded JSON
+              const decoded = Buffer.from(textData, 'base64').toString('utf8');
+              const parsed = JSON.parse(decoded);
+              console.log('Successfully loaded character card data');
+              return parsed;
+            } catch (e) {
+              // Maybe it's already JSON
+              try {
+                const parsed = JSON.parse(textData);
+                console.log('Successfully loaded character card data');
+                return parsed;
+              } catch (e2) {
+                console.warn('Failed to parse character card data:', e2);
+              }
+            }
+          }
+        }
+      }
+      offset += chunkLength + 4; // +4 for CRC
+    }
+    console.warn('No character data found in PNG file');
+    return null;
+  } catch (e) {
+    console.error('Error loading character card:', e);
+    return null;
+  }
+}
+
+// NEW: download a PNG to data/char and return saved path
+async function downloadPNG(urlStr, destDir) {
+  return new Promise((resolve, reject) => {
+    try {
+      const u = new URL(urlStr);
+      const mod = u.protocol === 'https:' ? https : http;
+      fs.mkdirSync(destDir, { recursive: true });
+      const filename = `char-${Date.now()}.png`;
+      const outPath = path.join(destDir, filename);
+      const file = fs.createWriteStream(outPath);
+      const req = mod.get(u, (res) => {
+        if (res.statusCode !== 200) {
+          file.close(); fs.unlink(outPath, () => {});
+          return reject(new Error(`HTTP ${res.statusCode}`));
+        }
+        const ct = String(res.headers['content-type'] || '');
+        if (!ct.includes('image/png')) {
+          // allow octet-stream with .png name
+          if (!ct.includes('application/octet-stream')) {
+            file.close(); fs.unlink(outPath, () => {});
+            return reject(new Error(`Invalid content-type: ${ct}`));
+          }
+        }
+        res.pipe(file);
+        file.on('finish', () => file.close(() => resolve(outPath)));
+      });
+      req.on('error', (err) => {
+        try { file.close(); fs.unlink(outPath, () => {}); } catch (_) {}
+        reject(err);
+      });
+    } catch (e) { reject(e); }
+  });
+}
+
 // Per-user conversation memory (array of {role, content}) to include previous Q/A
 const userConversations = new Map();
 const USER_CONV_LIMIT = Number(process.env.USER_CONV_LIMIT || 10);
 // Per-channel chat history (array of {user, text, ts}); used by askchat
 const channelChatHistory = new Map();
-const CHAT_HISTORY_LIMIT = Number(process.env.CHAT_HISTORY_LIMIT || 200); // messages
-const CHAT_HISTORY_MAX_CHARS = Number(process.env.CHAT_HISTORY_MAX_CHARS || 4000);
+const CHAT_HISTORY_LIMIT = Number(process.env.CHAT_HISTORY_LIMIT || 20000); // messages
+const CHAT_HISTORY_MAX_CHARS = Number(process.env.CHAT_HISTORY_MAX_CHARS || 400000);
 
 // token validation moved to `troubleshoot.js` (imported above)
 
@@ -140,30 +372,35 @@ client.on('message', async (channel, tags, message, self) => {
   const chanCfg = channelsCache.get(channelKey) || { prefix: '!', require_admin: false };
   const prefix = chanCfg.prefix || '!';
 
-  // Update recent users LRU (unique) for this channel
+  // Update recent users LRU (unique) for this channel and persist all chat messages
   try {
     const loginRaw = (tags && (tags.username || '')) || String(username || '');
     const login = String(loginRaw).toLowerCase().trim();
-    // Exclude bot accounts (any username containing 'bot')
-    if (login && !login.includes('bot')) {
+    if (login) {
       const arr = recentUsers.get(channelKey) || [];
       const idx = arr.indexOf(login);
       if (idx !== -1) arr.splice(idx, 1);
       arr.unshift(login);
       if (arr.length > 100) arr.length = 100;
       recentUsers.set(channelKey, arr);
-      // record chat message for channel history (skip bot accounts)
-      try {
-        const hist = channelChatHistory.get(channelKey) || [];
-        hist.push({ user: login, text: String(message || ''), ts: Date.now() });
-        if (hist.length > CHAT_HISTORY_LIMIT) hist.splice(0, hist.length - CHAT_HISTORY_LIMIT);
-        channelChatHistory.set(channelKey, hist);
-      } catch (e) {
-        console.error('Failed updating channelChatHistory:', e);
-      }
+    }
+    // Persist every chat message to DB
+    try {
+      await db.addChatMessage(channelKey, login, String(message || ''), Date.now());
+    } catch (e) {
+      console.error('Failed persisting chat message to DB:', e);
+    }
+    // Also update in-memory channelChatHistory for fast access (optional)
+    try {
+      const hist = channelChatHistory.get(channelKey) || [];
+      hist.push({ user: login, text: String(message || ''), ts: Date.now() });
+      if (hist.length > CHAT_HISTORY_LIMIT) hist.splice(0, hist.length - CHAT_HISTORY_LIMIT);
+      channelChatHistory.set(channelKey, hist);
+    } catch (e) {
+      console.error('Failed updating channelChatHistory:', e);
     }
   } catch (e) {
-    console.error('Failed updating recentUsers:', e);
+    console.error('Failed updating recentUsers or persisting chat:', e);
   }
 
     // If the first word mentions the bot by username, call the `ask` command.
@@ -179,55 +416,29 @@ client.on('message', async (channel, tags, message, self) => {
           if (first.toLowerCase() === botName) {
             const remainder = words.slice(1).join(' ').trim();
             if (remainder) {
+              // Check if user is banned before processing
+              const mentionUserId = String(tags['user-id'] || tags['userId'] || '');
+              if (mentionUserId && bannedUsersCache.has(String(mentionUserId))) {
+                // Silently ignore banned users
+                return;
+              }
               // parse optional model flag
               const parsed = extractModelFlag(remainder);
               const prompt = (parsed.rest || '').trim();
               const modelOverride = parsed.model || null;
               if (prompt) {
-                console.log(`[${time}] Direct mention LLM request from ${username}: ${prompt.slice(0,200)}`);
-                // Build messages similar to askchat handler
-                const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
-                const msgs = [];
-                if (LLM_SYSTEM_PROMPT) msgs.push({ role: 'system', content: LLM_SYSTEM_PROMPT });
-                const conv = userConversations.get(userKey) || [];
-                for (const m of conv) msgs.push(m);
-                const hist = channelChatHistory.get(channelKey) || [];
-                if (hist && hist.length) {
-                  let acc = '';
-                  for (let i = hist.length - 1; i >= 0; i--) {
-                    const entry = hist[i];
-                    const line = `${entry.user}: ${entry.text}\n`;
-                    if ((acc.length + line.length) > CHAT_HISTORY_MAX_CHARS) break;
-                    acc = line + acc;
-                  }
-                  if (acc) msgs.push({ role: 'system', content: `Recent channel messages:\n${acc}` });
-                }
-                msgs.push({ role: 'user', content: prompt });
-                try {
-                  const resp = await callOpenRouter(msgs, modelOverride);
-                  if (resp && resp.error) {
-                    console.error('OpenRouter error (mention):', resp.error);
-                    queueSend(channel, `AI error: ${resp.error}`).catch(()=>{});
-                  } else {
-                    const out = (resp.text || '').trim();
-                    if (!out) {
-                      queueSend(channel, `AI returned no text`).catch(()=>{});
-                    } else {
-                      // append to per-user conversation memory
-                      try {
-                        const convArr = userConversations.get(userKey) || [];
-                        convArr.push({ role: 'user', content: prompt });
-                        convArr.push({ role: 'assistant', content: out });
-                        while (convArr.length > USER_CONV_LIMIT) convArr.shift();
-                        userConversations.set(userKey, convArr);
-                      } catch (e) { console.error('Failed updating userConversations:', e); }
-                      await sendSplit(client, channel, [out]);
-                    }
-                  }
-                } catch (e) {
-                  console.error('ask (mention) error:', e);
-                  queueSend(channel, `AI request failed`).catch(()=>{});
-                }
+                const userKey = String((tags && (tags['user-id'] || tags['userId'] || tags.username || tags['display-name'])) || username || 'anonymous');
+                await handleLLMRequest({
+                  channel,
+                  userKey,
+                  prompt,
+                  modelOverride,
+                  channelKey,
+                  username,
+                  tags,
+                  time,
+                  source: 'mention',
+                });
               }
               return;
             }
@@ -237,6 +448,11 @@ client.on('message', async (channel, tags, message, self) => {
     } catch (e) {
       console.error('Bot mention detection error:', e);
     }
+
+  // Helper command as required by pajlada Bot guidelines
+  if (msg.startsWith(`!${process.env.TWITCH_USERNAME}`)) {
+    queueSend(channel, `Hi I'm a lidl clank-slop bot by @RoboSheepz. Ping me at the beginning of your message to chat or ${prefix}help for more.`).catch(()=>{});
+  }
 
   // Only treat messages that start with the configured prefix as commands
   if (!msg.startsWith(prefix)) return;
@@ -250,6 +466,16 @@ client.on('message', async (channel, tags, message, self) => {
 
   const userId = String(tags['user-id'] || tags['userId'] || '');
   const isAdmin = adminsCache.has(userId);
+
+  // Block banned users from all commands
+  try {
+    if (userId && bannedUsersCache.has(String(userId))) {
+      queueSend(channel, `You are banned from using bot commands.`).catch(()=>{});
+      return;
+    }
+  } catch (e) {
+    console.error('Banned user check error:', e);
+  }
 
   // Enforce per-user, per-command cooldown
   try {
@@ -267,6 +493,126 @@ client.on('message', async (channel, tags, message, self) => {
   } catch (e) {
     // if anything goes wrong, don't block command execution
     console.error('Cooldown check error:', e);
+  }
+  // Admin-only: ban a user from all commands
+  // Usage: <prefix>ban <username|uid>
+  if (command === 'ban') {
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    const target = parts[1];
+    if (!target) {
+      queueSend(channel, `Usage: ${prefix}ban <username|uid>`).catch(()=>{});
+      return;
+    }
+    const uid = await resolveToUid(target);
+    if (!uid) {
+      queueSend(channel, `Could not resolve '${target}' to a Twitch account`).catch(()=>{});
+      return;
+    }
+    await banUser(uid);
+    queueSend(channel, `User ${uid} has been banned from all bot commands.`).catch(()=>{});
+    return;
+  }
+
+  // Admin-only: unban a user
+  // Usage: <prefix>unban <username|uid>
+  if (command === 'unban') {
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    const target = parts[1];
+    if (!target) {
+      queueSend(channel, `Usage: ${prefix}unban <username|uid>`).catch(()=>{});
+      return;
+    }
+    const uid = await resolveToUid(target);
+    if (!uid) {
+      queueSend(channel, `Could not resolve '${target}' to a Twitch account`).catch(()=>{});
+      return;
+    }
+    await unbanUser(uid);
+    queueSend(channel, `User ${uid} has been unbanned.`).catch(()=>{});
+    return;
+  }
+
+  // Admin-only: make the bot say something
+  // Usage: <prefix>say <message>
+  if (command === 'say') {
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    let text = withoutPrefix.slice(command.length).trim();
+    let targetChannel = channel;
+    
+    // Check for --channel flag
+    const channelMatch = text.match(/^--channel\s+([^\s]+)\s+(.+)$/);
+    if (channelMatch) {
+      const specifiedChannel = channelMatch[1];
+      text = channelMatch[2];
+      // Normalize channel name (add # if not present)
+      targetChannel = specifiedChannel.startsWith('#') ? specifiedChannel : `#${specifiedChannel}`;
+    }
+    
+    if (!text) {
+      queueSend(channel, `Usage: ${prefix}say [--channel <channel>] <message>`).catch(()=>{});
+      return;
+    }
+    queueSend(targetChannel, text).catch(()=>{});
+    return;
+  }
+
+  // Admin-only: set LLM system prompt
+  if (command === 'setprompt') {
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    const newPrompt = withoutPrefix.slice(command.length).trim();
+    if (!newPrompt) {
+      queueSend(channel, `Usage: ${prefix}setprompt <text>`).catch(()=>{});
+      return;
+    }
+    try {
+      await db.setLLMSystemPrompt(newPrompt);
+      LLM_SYSTEM_PROMPT = newPrompt;
+      queueSend(channel, `LLM prompt updated.`).catch(()=>{});
+    } catch (e) {
+      console.error('Failed to set LLM prompt:', e);
+      queueSend(channel, `Failed to update prompt.`).catch(()=>{});
+    }
+    return;
+  }
+
+  // Admin-only: add character by PNG URL
+  if (command === 'addchar') {
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    const raw = withoutPrefix.slice(command.length).trim();
+    const first = extractFirstTokenPreservingQuotes(raw);
+    const url = first.token;
+    if (!url) {
+      queueSend(channel, `Usage: ${prefix}addchar <png-url>`).catch(()=>{});
+      return;
+    }
+    try {
+      const saved = await downloadPNG(url, path.join(__dirname, 'data', 'char'));
+      const rel = path.relative(__dirname, saved).replace(/\\/g, '/');
+      await db.setCharacterCardPath(rel);
+      LLM_CHARACTER_CARD = rel;
+      characterCardData = loadCharacterCard(LLM_CHARACTER_CARD);
+      const label = (characterCardData && (characterCardData.name || characterCardData.character || 'Character')) || path.basename(saved);
+      queueSend(channel, `Character set: ${label}`).catch(()=>{});
+    } catch (e) {
+      console.error('addchar error:', e);
+      queueSend(channel, `Failed to add character: ${e && e.message ? e.message : 'error'}`).catch(()=>{});
+    }
+    return;
   }
 
   // Enforce per-channel admin requirement: if channel requires admin for all commands, block non-admins
@@ -314,35 +660,84 @@ client.on('message', async (channel, tags, message, self) => {
   // callOpenRouter accepts either a prompt string or an array of messages [{role,content},...]
   // and an optional model override string as second argument
   async function callOpenRouter(input, modelOverride) {
-    if (!OPENROUTER_API_KEY) return { error: 'No OPENROUTER_API_KEY configured' };
+    if (!OPENROUTER_API_KEY) return { error: { message: 'No OPENROUTER_API_KEY configured' } };
     let OpenRouter;
     try {
       OpenRouter = require('@openrouter/sdk').OpenRouter;
     } catch (e) {
-      return { error: 'Missing @openrouter/sdk. Install with: npm install @openrouter/sdk' };
+      return { error: { message: 'Missing @openrouter/sdk. Install with: npm install @openrouter/sdk' } };
     }
 
-    try {
-      const or = new OpenRouter({ apiKey: OPENROUTER_API_KEY });
-      const messages = Array.isArray(input) ? input.map(m => ({ role: m.role, content: String(m.content) })) : [{ role: 'user', content: String(input) }];
-      const stream = await or.chat.send({
-        model: modelOverride || OPENROUTER_MODEL,
-        messages,
-        stream: true,
-        streamOptions: { includeUsage: true }
-      });
+    // Timeout wrapper - 30 seconds
+    const timeoutPromise = new Promise((resolve) => {
+      setTimeout(() => {
+        resolve({ error: { message: 'LLM timed out.', timeout: true } });
+      }, 30000);
+    });
 
-      let response = '';
-      let usage = null;
-      for await (const chunk of stream) {
-        const content = chunk.choices && chunk.choices[0] && (chunk.choices[0].delta?.content || chunk.choices[0].message?.content || chunk.choices[0].text);
-        if (content) response += content;
-        if (chunk.usage) usage = chunk.usage;
+    const llmPromise = (async () => {
+      try {
+        const or = new OpenRouter({ apiKey: OPENROUTER_API_KEY });
+        const messages = Array.isArray(input) ? input.map(m => ({ role: m.role, content: String(m.content) })) : [{ role: 'user', content: String(input) }];
+        const stream = await or.chat.send({
+          model: modelOverride || OPENROUTER_MODEL,
+          messages,
+          stream: true,
+          streamOptions: { includeUsage: true }
+        });
+
+        let response = '';
+        let usage = null;
+        for await (const chunk of stream) {
+          const content = chunk.choices && chunk.choices[0] && (chunk.choices[0].delta?.content || chunk.choices[0].message?.content || chunk.choices[0].text);
+          if (content) response += content;
+          if (chunk.usage) usage = chunk.usage;
+        }
+
+        return { text: String(response), usage };
+      } catch (err) {
+        // Build a structured error object with common fields
+        try {
+          const errObj = {
+            message: err && (err.message || String(err)) || 'Unknown error',
+            name: err && err.name || undefined,
+            code: err && (err.code || err.status || err.statusCode) || undefined,
+            status: err && (err.status || err.statusCode || (err.response && err.response.status)) || undefined,
+          };
+          // try to extract a small body/info if present
+          try {
+            const info = err && (err.response && (err.response.data || err.response.body) || err.body || err.raw);
+            if (info) {
+              const s = typeof info === 'string' ? info : JSON.stringify(info);
+              errObj.info = s.length > 500 ? (s.slice(0, 500) + '...') : s;
+            }
+          } catch (e) { /* ignore */ }
+          return { error: errObj };
+        } catch (e2) {
+          return { error: { message: String(err) } };
+        }
       }
+    })();
 
-      return { text: String(response), usage };
-    } catch (err) {
-      return { error: err && err.message ? err.message : String(err) };
+    // Race between LLM response and timeout
+    return Promise.race([llmPromise, timeoutPromise]);
+  }
+
+  // Helper: format AI error object/string into a concise single-line message
+  function formatAIError(err) {
+    if (!err) return 'Unknown error';
+    if (typeof err === 'string') return err;
+    try {
+      const parts = [];
+      if (err.message) parts.push(err.message);
+      if (err.name && err.name !== 'Error') parts.push(`(${err.name})`);
+      if (err.code) parts.push(`[code:${err.code}]`);
+      if (err.status) parts.push(`[status:${err.status}]`);
+      if (err.info) parts.push(`info:${err.info.slice(0,200)}`);
+      const out = parts.join(' ').trim();
+      return out || JSON.stringify(err).slice(0,300);
+    } catch (e) {
+      return String(err);
     }
   }
 
@@ -459,6 +854,8 @@ client.on('message', async (channel, tags, message, self) => {
     if (!m) return { token: str, rest: '' };
     return { token: m[1], rest: (m[2] || '').trim() };
   }
+
+  
 
 
     // Helper: extract a leading --model flag from a prompt string.
@@ -621,8 +1018,11 @@ client.on('message', async (channel, tags, message, self) => {
       ask: 'user',
       askchat: 'user',
       askclear: 'user',
-      lockdown: 'admin'
+      lockdown: 'admin',
+      setprompt: 'admin',      // NEW
+      addchar: 'admin'         // NEW
     };
+
     // if channel enforces admin for all commands, override default
     const effectiveAuth = (cmd) => (chanCfg && chanCfg.require_admin) ? 'admin' : (defaultAuth[cmd] || 'user');
 
@@ -637,6 +1037,11 @@ client.on('message', async (channel, tags, message, self) => {
     cmdLines.push(`${pfx}ask [--model MODEL] <question> - ask with recent channel chat as context (${effectiveAuth('ask')})`);
     cmdLines.push(`${pfx}askclear [username|uid] - clear your (or admin: another user's) AI conversation memory (${effectiveAuth('askclear')})`);
     cmdLines.push(`${pfx}lockdown [on|off|toggle] - restrict all bot commands to admins in this channel (${effectiveAuth('lockdown')})`);
+    cmdLines.push(`${pfx}ban <username|uid> - Ban user from all bot commands (admin)`);
+    cmdLines.push(`${pfx}unban <username|uid> - Unban user (admin)`);
+    cmdLines.push(`${pfx}say [--channel <channel>] <message> - Make the bot say something (admin)`);
+    cmdLines.push(`${pfx}setprompt <text> - Update the system prompt used for AI (admin)`); // NEW
+    cmdLines.push(`${pfx}addchar <png-url> - Download a PNG character card and set active (admin)`); // NEW
     sendSplit(client, channel, cmdLines).catch(err => console.error('Help send error:', err));
   }
 
@@ -674,57 +1079,18 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `Usage: ${prefix}ask [--model MODEL] <your question>`).catch(()=>{});
       return;
     }
-    console.log(`[${time}] askchat from ${username}: ${prompt.slice(0,200)}`);
-    try {
-      const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
-      const msgs = [];
-      if (LLM_SYSTEM_PROMPT) msgs.push({ role: 'system', content: LLM_SYSTEM_PROMPT });
-
-      // include per-user conv first
-      const conv = userConversations.get(userKey) || [];
-      for (const m of conv) msgs.push(m);
-
-      // compose recent channel chat history (most recent messages up to char cap)
-      const hist = channelChatHistory.get(channelKey) || [];
-      if (hist && hist.length) {
-        let acc = '';
-        // iterate from most recent backwards and build up to max chars
-        for (let i = hist.length - 1; i >= 0; i--) {
-          const entry = hist[i];
-          const line = `${entry.user}: ${entry.text}\n`;
-          if ((acc.length + line.length) > CHAT_HISTORY_MAX_CHARS) break;
-          acc = line + acc; // keep chronological order
-        }
-        if (acc) msgs.push({ role: 'system', content: `Recent channel messages:\n${acc}` });
-      }
-
-      msgs.push({ role: 'user', content: prompt });
-
-      const resp = await callOpenRouter(msgs, modelOverride);
-      if (resp.error) {
-        console.error('OpenRouter error:', resp.error);
-        queueSend(channel, `AI error: ${resp.error}`).catch(()=>{});
-        return;
-      }
-      const out = (resp.text || '').trim();
-      if (!out) {
-        queueSend(channel, `AI returned no text`).catch(()=>{});
-        return;
-      }
-      // append to per-user conversation memory
-      try {
-        const convArr = userConversations.get(userKey) || [];
-        convArr.push({ role: 'user', content: prompt });
-        convArr.push({ role: 'assistant', content: out });
-        while (convArr.length > USER_CONV_LIMIT) convArr.shift();
-        userConversations.set(userKey, convArr);
-      } catch (e) { console.error('Failed updating userConversations:', e); }
-
-      await sendSplit(client, channel, [out]);
-    } catch (e) {
-      console.error('askchat command error:', e);
-      queueSend(channel, `AI request failed`).catch(()=>{});
-    }
+    const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+    await handleLLMRequest({
+      channel,
+      userKey,
+      prompt,
+      modelOverride,
+      channelKey,
+      username,
+      tags,
+      time,
+      source: 'ask',
+    });
     return;
   }
 
@@ -745,72 +1111,90 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `You are not authorized to clear another user's memory.`).catch(()=>{});
       return;
     }
-    try {
-      // if numeric, treat as uid
-      if (/^\d+$/.test(target)) {
-        userConversations.delete(String(target));
-        queueSend(channel, `Cleared conversation memory for uid ${target}`).catch(()=>{});
-        return;
-      }
-      // try resolving to uid
-      const uid = await resolveToUid(target);
-      if (uid) {
-        userConversations.delete(String(uid));
-        queueSend(channel, `Cleared conversation memory for ${target} (uid ${uid})`).catch(()=>{});
-        return;
-      }
-      // fallback: remove by username key
-      const uname = String(target).toLowerCase();
-      if (userConversations.has(uname)) {
-        userConversations.delete(uname);
-        queueSend(channel, `Cleared conversation memory for ${target}`).catch(()=>{});
-        return;
-      }
-      queueSend(channel, `No conversation memory found for '${target}'`).catch(()=>{});
-    } catch (e) {
-      console.error('askclear error:', e);
-      queueSend(channel, `Failed to clear conversation memory for '${target}'`).catch(()=>{});
-    }
-    return;
+    // (No LLM call here, just admin logic)
   }
+  // Helper to handle LLM requests for ask, mention, etc. (per-channel context only)
+  async function handleLLMRequest({ channel, userKey, prompt, modelOverride, channelKey, username, tags, time, source }) {
+    try {
+      if (!prompt) return;
+      const msgs = [];
+      if (LLM_SYSTEM_PROMPT) msgs.push({ role: 'system', content: LLM_SYSTEM_PROMPT });
+      
+      // Add character card data if available
+      if (characterCardData) {
+        let cardContent = '';
+        if (characterCardData.name) cardContent += `Character: ${characterCardData.name}\n`;
+        if (characterCardData.description) cardContent += `Description: ${characterCardData.description}\n`;
+        if (characterCardData.personality) cardContent += `Personality: ${characterCardData.personality}\n`;
+        if (characterCardData.scenario) cardContent += `Scenario: ${characterCardData.scenario}\n`;
+        if (characterCardData.first_mes) cardContent += `First Message: ${characterCardData.first_mes}\n`;
+        if (characterCardData.mes_example) cardContent += `Example Messages: ${characterCardData.mes_example}\n`;
+        if (cardContent) {
+          msgs.push({ role: 'system', content: cardContent.trim() });
+        }
+      }
 
-  // Admin-only: massping - send a single (<=500 char) message listing most recent usernames for this channel
-  if (command === 'massping') {
-    if (!isAdmin) {
-      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
-      return;
-    }
-    try {
-      const arr = recentUsers.get(channelKey) || [];
-      if (!arr.length) {
-        queueSend(channel, `No recent users to massping.`).catch(()=>{});
+      // Only include per-channel context (no per-user conversation)
+      // Budget history by model token window
+      let baseUserMsg = { role: 'user', content: prompt };
+      // Estimate tokens for fixed parts (system + card + user prompt)
+      const baseTokens = estimateMessagesTokens([...msgs, baseUserMsg]);
+      const maxContext = Math.max(LLM_CONTEXT_TOKENS, 1024);
+      const availableForHistory = Math.max(0, maxContext - LLM_RESPONSE_TOKEN_BUFFER - baseTokens);
+
+      // Retrieve recent chat history from DB (persistent) without char trimming
+      let histRows = [];
+      try {
+        histRows = await db.getRecentChatMessages(channelKey, CHAT_HISTORY_LIMIT, 0);
+      } catch (e) {
+        console.error('Failed to fetch persistent chat history:', e);
+      }
+
+      if (histRows && histRows.length && availableForHistory > 0) {
+        // Build from oldest to newest until token budget is exhausted
+        let histText = '';
+        let histTokens = 0;
+        for (let i = histRows.length - 1; i >= 0; i--) {
+          const entry = histRows[i];
+          const line = `${entry.user}: ${entry.text}\n`;
+          const lineTokens = estimateTokensForText(line);
+          if ((histTokens + lineTokens) > availableForHistory) break;
+          histTokens += lineTokens;
+          histText += line;
+        }
+        if (histText) msgs.push({ role: 'system', content: `Recent channel messages:\n${histText}` });
+      }
+
+      msgs.push(baseUserMsg);
+
+      // Log the entire messages array sent to LLM
+      console.log(`LLM REQUEST (${source || 'unknown'}, all prompt/context):`, JSON.stringify(msgs, null, 2));
+
+      const resp = await callOpenRouter(msgs, modelOverride);
+      if (resp.error) {
+        console.error('OpenRouter error:', resp.error);
+        const msg = formatAIError(resp.error);
+        queueSend(channel, `AI error: ${msg}`).catch(()=>{});
         return;
       }
-      // Build a single message up to 500 characters containing @user mentions (most recent first)
-      const maxLen = 500;
-      let msgParts = [];
-      let curLen = 0;
-      for (const u of arr) {
-        const mention = `@${u}`;
-        const addition = (msgParts.length ? ' ' : '') + mention;
-        if ((curLen + addition.length) > maxLen) break;
-        msgParts.push(mention);
-        curLen += addition.length;
-      }
-      const out = msgParts.join(' ');
+      const out = (resp.text || '').trim();
       if (!out) {
-        queueSend(channel, `No recent users fit into a ${maxLen} char message.`).catch(()=>{});
+        queueSend(channel, `AI returned no text`).catch(()=>{});
         return;
       }
-      // Send as a single message (not split)
-      queueSend(channel, out).catch(err => console.error(`[${time}] Error sending massping:`, err));
+
+      // Check if response is too long
+      if (out.length > 2000) {
+        queueSend(channel, `LLM sent a long response.`).catch(()=>{});
+        return;
+      }
+
+      await sendSplit(client, channel, [out]);
     } catch (e) {
-      console.error('massping error:', e);
-      queueSend(channel, `Failed to build massping message.`).catch(()=>{});
+      console.error('LLM request handler error:', e);
+      queueSend(channel, `AI request failed`).catch(()=>{});
     }
-    return;
   }
-  
   // Admin-only: set prefix for current channel
   // Usage: <prefix>setprefix <newPrefix>
   if (command === 'setprefix') {
@@ -905,7 +1289,11 @@ client.on('message', async (channel, tags, message, self) => {
 // Attach debug handlers moved to troubleshoot.js
 attachDebug(client, opts);
 // Validate token, init DB, load caches, then connect
+// Add DB helpers for banned users if not present
+// db.addBannedUser(uid), db.removeBannedUser(uid), db.loadBannedUsers()
+
 (async () => {
+  // CHANGED: load from DB after init
   try {
     const info = await validateToken(process.env.TWITCH_OAUTH);
     console.log(`Token belongs to login: ${info.login || 'unknown'}`);
@@ -917,10 +1305,35 @@ attachDebug(client, opts);
 
   try {
     await db.init();
+    await db.ensureLLMDefaultsFromEnv(); // NEW
     adminsCache = await db.loadAdmins();
     channelsCache = await db.loadChannels();
+    if (db.loadBannedUsers) {
+      bannedUsersCache = new Set(await db.loadBannedUsers());
+    } else {
+      bannedUsersCache = new Set();
+    }
+    // Load persisted LLM settings
+    try {
+      const dbPrompt = await db.getLLMSystemPrompt();
+      if (dbPrompt) LLM_SYSTEM_PROMPT = dbPrompt;
+      const dbCardPath = await db.getCharacterCardPath();
+      if (dbCardPath) LLM_CHARACTER_CARD = dbCardPath;
+    } catch (e) {
+      console.error('Failed to load LLM settings from DB:', e);
+    }
+
+    // Load character card if specified (from DB or .env)
+    if (LLM_CHARACTER_CARD) {
+      characterCardData = loadCharacterCard(LLM_CHARACTER_CARD);
+      if (characterCardData) {
+        console.log(`Loaded character card: ${characterCardData.name || 'Unknown'}`);
+      }
+    }
+
     console.log(`Loaded admins: ${Array.from(adminsCache).join(', ')}`);
     console.log(`Loaded channels: ${Array.from(channelsCache.keys()).join(', ')}`);
+    console.log(`Loaded banned users: ${Array.from(bannedUsersCache).join(', ')}`);
   } catch (err) {
     console.error('DB init/load error:', err);
   }
