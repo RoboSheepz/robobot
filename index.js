@@ -1074,7 +1074,21 @@ client.on('message', async (channel, tags, message, self) => {
     sendSplit(client, channel, [`Username: ${info.login}`, `Display: ${info.display_name}`, `UID: ${info.id}`, `Created: ${info.created_at}`, `Status: ${status}`]).catch(()=>{});
   }
 
-  
+  // Admin-only: send a single message with all recent users in this channel
+  // Usage: <prefix>massping
+  if (command === 'massping') {
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    const recentUsersList = recentUsers.get(channelKey) || [];
+    if (!recentUsersList.length) {
+      queueSend(channel, `No recent users recorded for this channel.`).catch(()=>{});
+      return;
+    }
+    const message = recentUsersList.join(' ');
+    queueSend(channel, message).catch(()=>{});
+  }
 
   // Ask LLM including recent channel chat history as context: <prefix>ask <prompt>
   if (command === 'ask' || command === 'ai') {
