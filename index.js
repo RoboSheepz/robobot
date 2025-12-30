@@ -753,7 +753,17 @@ client.on('message', async (channel, tags, message, self) => {
 
         let response = '';
         let usage = null;
+        let isFirstChunk = true;
         for await (const chunk of stream) {
+          // Check if this looks like an error response instead of a stream chunk
+          if (isFirstChunk) {
+            isFirstChunk = false;
+            // If chunk is missing expected stream fields, it might be an error
+            if (!chunk || (!chunk.choices && !chunk.data)) {
+              console.warn('Unexpected chunk structure, may be error:', chunk);
+            }
+          }
+          
           let content = null;
           const choices = chunk && chunk.choices;
           const first = choices && choices[0];
@@ -1275,7 +1285,13 @@ client.on('message', async (channel, tags, message, self) => {
       // Estimate tokens for fixed parts (system + card + user prompt)
       const baseTokens = estimateMessagesTokens([...msgs, baseUserMsg]);
       const maxContext = Math.max(LLM_CONTEXT_TOKENS, 1024);
-      const availableForHistory = Math.max(0, maxContext - LLM_RESPONSE_TOKEN_BUFFER - baseTokens);
+      // Be more conservative: use 70% of available tokens for input (leaves 30% buffer)
+      const conservativeMax = Math.floor(maxContext * 0.7);
+      const availableForHistory = Math.max(0, conservativeMax - LLM_RESPONSE_TOKEN_BUFFER - baseTokens);
+      
+      if (availableForHistory < 100) {
+        console.warn(`Very low token budget for history: ${availableForHistory} tokens. Skipping chat history.`);
+      }
 
       // Retrieve recent chat history from DB (persistent) without char trimming
       let histRows = [];
@@ -1304,7 +1320,7 @@ client.on('message', async (channel, tags, message, self) => {
 
       // Final token budget check before sending to LLM
       const totalTokens = estimateMessagesTokens(msgs);
-      const maxAllowed = LLM_CONTEXT_TOKENS - LLM_RESPONSE_TOKEN_BUFFER;
+      const maxAllowed = conservativeMax - LLM_RESPONSE_TOKEN_BUFFER;
       if (totalTokens > maxAllowed) {
         console.warn(`Token budget exceeded: ${totalTokens} > ${maxAllowed}. Trimming history.`);
         // Remove history messages and rebuild if needed
