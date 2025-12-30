@@ -535,7 +535,7 @@ client.on('message', async (channel, tags, message, self) => {
   // Block banned users from all commands
   try {
     if (userId && bannedUsersCache.has(String(userId))) {
-      queueSend(channel, `You are banned from using bot commands.`).catch(()=>{});
+      queueSend(channel, `You are banned from using bot commands. BAND`).catch(()=>{});
       return;
     }
   } catch (e) {
