@@ -129,7 +129,7 @@ function queueSend(channel, text) {
   return enqueueSend(channel, text);
 }
 
-// Helper function to send whispers (DMs) split into chunks
+// Helper function to send whispers (DMs) split into chunks via IRC /w command
 async function sendWhisperSplit(username, messages) {
   if (!username) return Promise.reject(new Error('No username provided for whisper'));
   if (!Array.isArray(messages)) messages = [messages];
@@ -159,8 +159,26 @@ async function sendWhisperSplit(username, messages) {
   
   for (const chunk of chunks) {
     await new Promise(resolve => {
-      setTimeout(() => {
-        client.whisper(username, chunk).catch(err => console.error('Whisper error:', err));
+      setTimeout(async () => {
+        try {
+          // Send via IRC - whispers are sent as regular messages via the client connection
+          // Use the raw command or via a channel if the bot is in one
+          const primaryChannel = Array.from(client.channels || []).find(ch => ch.startsWith('#'));
+          if (primaryChannel) {
+            // Send from a known channel where bot is joined
+            await client.say(primaryChannel, `/w ${username} ${chunk}`);
+          } else {
+            // Fallback: use sendAndLog with a fallback channel
+            console.warn('No primary channel found for whisper, attempting via any joined channel');
+            if (client.channels && client.channels.length > 0) {
+              await client.say(client.channels[0], `/w ${username} ${chunk}`);
+            } else {
+              console.error('No channels available to send whisper from');
+            }
+          }
+        } catch (err) {
+          console.error('Whisper send error:', err);
+        }
         resolve();
       }, MESSAGE_INTERVAL_MS);
     });
@@ -860,18 +878,24 @@ client.on('message', async (channel, tags, message, self) => {
     const chunks = [];
     // build chunks first
     for (const line of lines) {
-      if (line.length <= max) {
+      // Replace leading $ with [dollar sign]
+      let processedLine = String(line || '');
+      if (processedLine.startsWith('$')) {
+        processedLine = '[dollar sign]' + processedLine.slice(1);
+      }
+      
+      if (processedLine.length <= max) {
         // try to merge into last chunk if possible
         const last = chunks.length ? chunks[chunks.length - 1] : null;
-        if (last && (last.length + 1 + line.length) <= max) {
-          chunks[chunks.length - 1] = last + '\n' + line;
+        if (last && (last.length + 1 + processedLine.length) <= max) {
+          chunks[chunks.length - 1] = last + '\n' + processedLine;
         } else {
-          chunks.push(line);
+          chunks.push(processedLine);
         }
       } else {
         // split long line into max-sized pieces
-        for (let i = 0; i < line.length; i += max) {
-          chunks.push(line.slice(i, i + max));
+        for (let i = 0; i < processedLine.length; i += max) {
+          chunks.push(processedLine.slice(i, i + max));
         }
       }
     }
