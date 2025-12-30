@@ -129,6 +129,44 @@ function queueSend(channel, text) {
   return enqueueSend(channel, text);
 }
 
+// Helper function to send whispers (DMs) split into chunks
+async function sendWhisperSplit(username, messages) {
+  if (!username) return Promise.reject(new Error('No username provided for whisper'));
+  if (!Array.isArray(messages)) messages = [messages];
+  
+  const chunks = [];
+  const MAX_WHISPER_LENGTH = 500; // Twitch whisper limit is 500 chars
+  
+  for (const msg of messages) {
+    const text = String(msg || '');
+    if (text.length <= MAX_WHISPER_LENGTH) {
+      chunks.push(text);
+    } else {
+      // Split long message into chunks
+      let current = '';
+      const words = text.split(' ');
+      for (const word of words) {
+        if ((current + ' ' + word).length > MAX_WHISPER_LENGTH) {
+          if (current) chunks.push(current);
+          current = word;
+        } else {
+          current = current ? current + ' ' + word : word;
+        }
+      }
+      if (current) chunks.push(current);
+    }
+  }
+  
+  for (const chunk of chunks) {
+    await new Promise(resolve => {
+      setTimeout(() => {
+        client.whisper(username, chunk).catch(err => console.error('Whisper error:', err));
+        resolve();
+      }, MESSAGE_INTERVAL_MS);
+    });
+  }
+}
+
 const opts = {
   options: { debug: true },
   identity: {
@@ -531,7 +569,7 @@ client.on('message', async (channel, tags, message, self) => {
       return;
     }
     await banUser(uid);
-    queueSend(channel, `User ${uid} has been banned from all bot commands.`).catch(()=>{});
+    queueSend(channel, `User ${uid} has been banned from all bot commands. BAND`).catch(()=>{});
     return;
   }
 
@@ -1058,7 +1096,9 @@ client.on('message', async (channel, tags, message, self) => {
     cmdLines.push(`${pfx}say [--channel <channel>] <message> - Make the bot say something (admin)`);
     cmdLines.push(`${pfx}setprompt <text> - Update the system prompt used for AI (admin)`); // NEW
     cmdLines.push(`${pfx}addchar <png-url> - Download a PNG character card and set active (admin)`); // NEW
-    sendSplit(client, channel, cmdLines).catch(err => console.error('Help send error:', err));
+    
+    // Send help via whisper instead of channel
+    sendWhisperSplit(username, cmdLines).catch(err => console.error('Help whisper error:', err));
   }
 
   if (command === 'uid') {
@@ -1153,12 +1193,43 @@ client.on('message', async (channel, tags, message, self) => {
     }
     // (No LLM call here, just admin logic)
   }
+  // Helper function to format user info from tags
+  function formatUserInfo(tags) {
+    if (!tags) return '';
+    const userInfoParts = [];
+    
+    // Include all available user information
+    if (tags.username) userInfoParts.push(`Username: ${tags.username}`);
+    if (tags['display-name']) userInfoParts.push(`Display Name: ${tags['display-name']}`);
+    if (tags['user-id']) userInfoParts.push(`User ID: ${tags['user-id']}`);
+    if (tags.color) userInfoParts.push(`Color: ${tags.color}`);
+    if (tags['created-at']) userInfoParts.push(`Account Created: ${tags['created-at']}`);
+    if (tags.badges) {
+      const badgeStr = Object.entries(tags.badges || {}).map(([k, v]) => `${k}/${v}`).join(', ');
+      if (badgeStr) userInfoParts.push(`Badges: ${badgeStr}`);
+    }
+    if (tags.mod === true) userInfoParts.push(`Moderator: Yes`);
+    if (tags.subscriber === true) userInfoParts.push(`Subscriber: Yes`);
+    if (tags.turbo === true) userInfoParts.push(`Turbo: Yes`);
+    if (tags['message-type']) userInfoParts.push(`Message Type: ${tags['message-type']}`);
+    if (tags['reply-parent-user-login']) userInfoParts.push(`Reply To: ${tags['reply-parent-user-login']}`);
+    if (tags['room-id']) userInfoParts.push(`Room ID: ${tags['room-id']}`);
+    
+    return userInfoParts.join('\n');
+  }
+
   // Helper to handle LLM requests for ask, mention, etc. (per-channel context only)
   async function handleLLMRequest({ channel, userKey, prompt, modelOverride, channelKey, username, tags, time, source }) {
     try {
       if (!prompt) return;
       const msgs = [];
       if (LLM_SYSTEM_PROMPT) msgs.push({ role: 'system', content: LLM_SYSTEM_PROMPT });
+      
+      // Add user information from tags
+      const userInfo = formatUserInfo(tags);
+      if (userInfo) {
+        msgs.push({ role: 'system', content: `User Information:\n${userInfo}` });
+      }
       
       // Add character card data if available
       if (characterCardData) {
