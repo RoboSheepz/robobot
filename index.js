@@ -97,6 +97,13 @@ async function processSendQueue() {
   while (sendQueue.length) {
     const item = sendQueue.shift();
     try {
+      // Validate mention count (max 10 valid mentions per message)
+      const isValid = await validateMentionCount(item.text);
+      if (!isValid) {
+        item.reject(new Error('Message contains too many mentions (max 10 valid mentions allowed)'));
+        continue;
+      }
+      
       // Check message against banphrase API
       const banResult = await checkBanphrase(item.text);
       let messageToSend = item.text;
@@ -122,6 +129,34 @@ async function processSendQueue() {
     await new Promise(r => setTimeout(r, MESSAGE_INTERVAL_MS));
   }
   sendProcessing = false;
+}
+
+// Helper: validate that a message has no more than 10 mentions
+async function validateMentionCount(text) {
+  if (!text) return true;
+  // Extract potential mentions (@username pattern)
+  const mentionMatches = text.match(/@([a-zA-Z0-9_]{1,25})/g) || [];
+  if (mentionMatches.length <= 10) return true;
+  
+  // More than 10 mentions found - validate them using Helix to confirm they're real users
+  const uniqueMentions = [...new Set(mentionMatches.map(m => m.slice(1).toLowerCase()))];
+  let validCount = 0;
+  
+  for (const mention of uniqueMentions) {
+    try {
+      const user = await fetchHelixUser({ login: mention });
+      if (user) validCount++;
+    } catch (e) {
+      // ignore errors, just skip
+    }
+  }
+  
+  // If more than 10 valid mentions, reject
+  if (validCount > 10) {
+    console.warn(`Message blocked: ${validCount} mentions exceeds limit of 10`);
+    return false;
+  }
+  return true;
 }
 
 // Convenience wrapper used throughout: queue the send
@@ -919,10 +954,23 @@ client.on('message', async (channel, tags, message, self) => {
           chunks.push(processedLine);
         }
       } else {
-        // split long line into max-sized pieces
-        for (let i = 0; i < processedLine.length; i += max) {
-          chunks.push(processedLine.slice(i, i + max));
+        // split long line at word boundaries
+        let remaining = processedLine;
+        while (remaining.length > max) {
+          // Find the last space within the max length
+          let chunk = remaining.slice(0, max);
+          const lastSpace = chunk.lastIndexOf(' ');
+          if (lastSpace > 0) {
+            // Split at the word boundary
+            chunks.push(chunk.slice(0, lastSpace));
+            remaining = remaining.slice(lastSpace + 1);
+          } else {
+            // No space found, force split at max
+            chunks.push(chunk);
+            remaining = remaining.slice(max);
+          }
         }
+        if (remaining) chunks.push(remaining);
       }
     }
 
