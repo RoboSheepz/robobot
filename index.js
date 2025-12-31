@@ -1346,7 +1346,7 @@ client.on('message', async (channel, tags, message, self) => {
         if (newTotal > maxAllowed) {
           const msg = `Token limit exceeded (${newTotal}/${maxAllowed} tokens). Question too long.`;
           console.error(msg);
-          sendSplit(client, channel, [msg]).catch(()=>{});
+          endSplit(client, channel, ['LLM Error: Input tokens exceeded']).catch(()=>{});
           return;
         }
       }
@@ -1357,26 +1357,25 @@ client.on('message', async (channel, tags, message, self) => {
       const resp = await callOpenRouter(msgs, modelOverride);
       if (resp.error) {
         console.error('OpenRouter error:', resp.error);
-        const msg = formatAIError(resp.error);
-        sendSplit(client, channel, [`AI error: ${msg}`]).catch(()=>{});
+        sendSplit(client, channel, [`LLM Error`]).catch(()=>{});
         return;
       }
       const out = (resp.text || '').trim();
       if (!out) {
-        queueSend(channel, `AI returned no text`).catch(()=>{});
+        queueSend(channel, `LLM returned no text`).catch(()=>{});
         return;
       }
 
       // Check if response is too long
-      if (out.length > 2000) {
-        queueSend(channel, `LLM sent a long response.`).catch(()=>{});
+      if (out.length > 1000) {
+        queueSend(channel, `LLM sent a long response`).catch(()=>{});
         return;
       }
 
       await sendSplit(client, channel, [out]);
     } catch (e) {
       console.error('LLM request handler error:', e);
-      queueSend(channel, `AI request failed`).catch(()=>{});
+      queueSend(channel, `LLM request handler error`).catch(()=>{});
     }
   }
   // Admin-only: set prefix for current channel
