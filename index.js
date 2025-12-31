@@ -418,6 +418,37 @@ const channelChatHistory = new Map();
 const CHAT_HISTORY_LIMIT = Number(process.env.CHAT_HISTORY_LIMIT || 20000); // messages
 const CHAT_HISTORY_MAX_CHARS = Number(process.env.CHAT_HISTORY_MAX_CHARS || 400000);
 
+// Helper: fetch user info from Helix by login or id. Returns parsed user obj or null.
+function fetchHelixUser({ login, id }) {
+  return new Promise((resolve, reject) => {
+    if (!helixClientId) return resolve(null);
+    const token = String(process.env.TWITCH_OAUTH || '').replace(/^oauth:/i, '');
+    const params = login ? `login=${encodeURIComponent(login)}` : `id=${encodeURIComponent(id)}`;
+    const options = {
+      hostname: 'api.twitch.tv',
+      path: `/helix/users?${params}`,
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Client-Id': helixClientId
+      }
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data || '{}');
+          if (parsed && Array.isArray(parsed.data) && parsed.data.length) return resolve(parsed.data[0]);
+          return resolve(null);
+        } catch (e) { return resolve(null); }
+      });
+    });
+    req.on('error', (err) => resolve(null));
+    req.end();
+  });
+}
+
 // token validation moved to `troubleshoot.js` (imported above)
 
 client.on('message', async (channel, tags, message, self) => {
@@ -740,37 +771,6 @@ client.on('message', async (channel, tags, message, self) => {
       sendSplit(client, channel, [`Failed to add character: ${e && e.message ? e.message : 'error'}`]).catch(()=>{});
     }
     return;
-  }
-
-  // Helper: fetch user info from Helix by login or id. Returns parsed user obj or null.
-  function fetchHelixUser({ login, id }) {
-    return new Promise((resolve, reject) => {
-      if (!helixClientId) return resolve(null);
-      const token = String(process.env.TWITCH_OAUTH || '').replace(/^oauth:/i, '');
-      const params = login ? `login=${encodeURIComponent(login)}` : `id=${encodeURIComponent(id)}`;
-      const options = {
-        hostname: 'api.twitch.tv',
-        path: `/helix/users?${params}`,
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Client-Id': helixClientId
-        }
-      };
-      const req = https.request(options, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => {
-          try {
-            const parsed = JSON.parse(data || '{}');
-            if (parsed && Array.isArray(parsed.data) && parsed.data.length) return resolve(parsed.data[0]);
-            return resolve(null);
-          } catch (e) { return resolve(null); }
-        });
-      });
-      req.on('error', (err) => resolve(null));
-      req.end();
-    });
   }
 
   // Helper: call OpenRouter using the official SDK and stream results
