@@ -487,6 +487,22 @@ client.on('message', async (channel, tags, message, self) => {
                   return;
                 }
               }
+              // Enforce per-user cooldown for mentions (treat as 'mention' command)
+              try {
+                const nowMs = Date.now();
+                const userKey = mentionUserId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+                const cooldownKey = `${userKey}:mention`;
+                const last = commandCooldowns.get(cooldownKey) || 0;
+                if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
+                  const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
+                  console.log(`[${time}] Cooldown: user ${userKey} mentioned bot — wait ${wait}s`);
+                  return;
+                }
+                // record this invocation
+                commandCooldowns.set(cooldownKey, nowMs);
+              } catch (e) {
+                console.error('Cooldown check error:', e);
+              }
               // parse optional model flag
               const parsed = extractModelFlag(remainder);
               const prompt = (parsed.rest || '').trim();
