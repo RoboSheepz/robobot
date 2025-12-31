@@ -270,7 +270,7 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'gpt-4o-mini';
 const OPENROUTER_URL = process.env.OPENROUTER_URL || 'https://api.openrouter.ai/v1/chat/completions';
 // Optional system prompt / extra context to include with every LLM call
-let LLM_SYSTEM_PROMPT = process.env.LLM_SYSTEM_PROMPT || 'You are to play the role of a concise assistant in a Twitch chat.'; // CHANGED: let
+let LLM_SYSTEM_PROMPT = null; // Will be loaded from data/prompt.txt
 // Optional character card (JanitorAI PNG format)
 let LLM_CHARACTER_CARD = process.env.LLM_CHARACTER_CARD || null; // CHANGED: let
 let characterCardData = null;
@@ -1652,8 +1652,32 @@ attachDebug(client, opts);
     }
     // Load persisted LLM settings
     try {
-      const dbPrompt = await db.getLLMSystemPrompt();
-      if (dbPrompt) LLM_SYSTEM_PROMPT = dbPrompt;
+      // First, try to load prompt from file data/prompt.txt
+      const promptPath = path.join(__dirname, 'data', 'prompt.txt');
+      try {
+        if (fs.existsSync(promptPath)) {
+          LLM_SYSTEM_PROMPT = fs.readFileSync(promptPath, 'utf8').trim();
+          console.log('Loaded LLM prompt from data/prompt.txt');
+        }
+      } catch (e) {
+        console.warn('Failed to load prompt from file:', e.message);
+      }
+      
+      // If still no prompt, try to load from DB
+      if (!LLM_SYSTEM_PROMPT) {
+        const dbPrompt = await db.getLLMSystemPrompt();
+        if (dbPrompt) {
+          LLM_SYSTEM_PROMPT = dbPrompt;
+          console.log('Loaded LLM prompt from database');
+        }
+      }
+      
+      // Set default if still no prompt
+      if (!LLM_SYSTEM_PROMPT) {
+        LLM_SYSTEM_PROMPT = 'You are to play the role of a concise assistant in a Twitch chat.';
+        console.log('Using default LLM prompt');
+      }
+      
       const dbCardPath = await db.getCharacterCardPath();
       if (dbCardPath) LLM_CHARACTER_CARD = dbCardPath;
     } catch (e) {
