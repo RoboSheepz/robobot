@@ -110,7 +110,7 @@ async function processSendQueue() {
       
       if (banResult.banned) {
         console.log(`Message blocked by banphrase API: "${item.text}"`);
-        messageToSend = '[banphrased]';
+        messageToSend = 'Teehee, the banphrase API didn\'t like that~';
       }
       
       // record outgoing message immediately so echoes can be detected
@@ -154,6 +154,7 @@ async function validateMentionCount(text) {
   // If more than 10 valid mentions, reject
   if (validCount > 10) {
     console.warn(`Message blocked: ${validCount} mentions exceeds limit of 10`);
+    enqueueSend(channel, `Grrrr... Don't ping so many people, silly~!`).catch(()=>{});
     return false;
   }
   return true;
@@ -1446,7 +1447,7 @@ client.on('message', async (channel, tags, message, self) => {
         if (newTotal > maxAllowed) {
           const msg = `Token limit exceeded (${newTotal}/${maxAllowed} tokens). Question too long.`;
           console.error(msg);
-          endSplit(client, channel, ['LLM Error: Input tokens exceeded']).catch(()=>{});
+          sendSplit(client, channel, ['/me grabs your throat']).catch(()=>{});
           return;
         }
       }
@@ -1457,25 +1458,25 @@ client.on('message', async (channel, tags, message, self) => {
       const resp = await callOpenRouter(msgs, modelOverride);
       if (resp.error) {
         console.error('OpenRouter error:', resp.error);
-        sendSplit(client, channel, [`LLM Error`]).catch(()=>{});
+        sendSplit(client, channel, [`/me ignores you`]).catch(()=>{});
         return;
       }
       const out = (resp.text || '').trim();
       if (!out) {
-        queueSend(channel, `LLM returned no text`).catch(()=>{});
+        queueSend(channel, `/me ignores you`).catch(()=>{});
         return;
       }
 
       // Check if response is too long
       if (out.length > 1000) {
-        queueSend(channel, `LLM sent a long response`).catch(()=>{});
+        queueSend(channel, `/me trips and falls`).catch(()=>{});
         return;
       }
 
       await sendSplit(client, channel, [out]);
     } catch (e) {
       console.error('LLM request handler error:', e);
-      queueSend(channel, `LLM request handler error`).catch(()=>{});
+      queueSend(channel, `/me growls`).catch(()=>{});
     }
   }
   // Admin-only: set prefix for current channel
