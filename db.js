@@ -41,6 +41,12 @@ function init() {
         value TEXT
       );`);
 
+      // NEW: online_mode settings per channel (whether bot lockdowns when streamer is online)
+      db.run(`CREATE TABLE IF NOT EXISTS online_mode (
+        channel TEXT PRIMARY KEY,
+        enabled INTEGER DEFAULT 1
+      );`);
+
       // Migrate/add require_admin column if missing, then perform default inserts and close inside callback
       db.all(`PRAGMA table_info(channels)`, [], (err, cols) => {
         if (err) {
@@ -309,5 +315,54 @@ module.exports = {
   setLLMSystemPrompt,
   getCharacterCardPath,
   setCharacterCardPath,
-  ensureLLMDefaultsFromEnv
+  ensureLLMDefaultsFromEnv,
+
+  // NEW: online mode helpers
+  getOnlineModeEnabled: function(channel) {
+    return new Promise((resolve, reject) => {
+      const db = openDb();
+      db.get(`SELECT enabled FROM online_mode WHERE channel = ?`, [channel], (err, row) => {
+        db.close();
+        if (err) return reject(err);
+        // Default to true (1) if not set
+        resolve(row ? !!row.enabled : true);
+      });
+    });
+  },
+
+  setOnlineModeEnabled: function(channel, enabled) {
+    return new Promise((resolve, reject) => {
+      const db = openDb();
+      const val = enabled ? 1 : 0;
+      db.run(`INSERT OR REPLACE INTO online_mode(channel, enabled) VALUES(?, ?)`, [channel, val], function(err) {
+        db.close();
+        if (err) return reject(err);
+        resolve();
+      });
+    });
+  },
+
+  toggleOnlineMode: function(channel) {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const db = openDb();
+        db.get(`SELECT enabled FROM online_mode WHERE channel = ?`, [channel], async (err, row) => {
+          if (err) {
+            db.close();
+            return reject(err);
+          }
+          const current = row ? !!row.enabled : true;
+          const newValue = !current;
+          
+          db.run(`INSERT OR REPLACE INTO online_mode(channel, enabled) VALUES(?, ?)`, [channel, newValue ? 1 : 0], function(err2) {
+            db.close();
+            if (err2) return reject(err2);
+            resolve(newValue);
+          });
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
 };

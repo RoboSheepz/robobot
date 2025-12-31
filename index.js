@@ -196,21 +196,8 @@ async function sendWhisperSplit(username, messages) {
     await new Promise(resolve => {
       setTimeout(async () => {
         try {
-          // Send via IRC - whispers are sent as regular messages via the client connection
-          // Use the raw command or via a channel if the bot is in one
-          const primaryChannel = Array.from(client.channels || []).find(ch => ch.startsWith('#'));
-          if (primaryChannel) {
-            // Send from a known channel where bot is joined
-            await client.say(primaryChannel, `/w ${username} ${chunk}`);
-          } else {
-            // Fallback: use sendAndLog with a fallback channel
-            console.warn('No primary channel found for whisper, attempting via any joined channel');
-            if (client.channels && client.channels.length > 0) {
-              await client.say(client.channels[0], `/w ${username} ${chunk}`);
-            } else {
-              console.error('No channels available to send whisper from');
-            }
-          }
+          // Use tmi.js whisper method (sends via IRC PRIVMSG WHISPER)
+          await client.whispers(username, chunk);
         } catch (err) {
           console.error('Whisper send error:', err);
         }
@@ -603,6 +590,20 @@ client.on('message', async (channel, tags, message, self) => {
     console.error('Channel auth enforcement error:', e);
   }
 
+  // Check online mode: if enabled, lock down when streamer is live
+  try {
+    const onlineModeEnabled = await db.getOnlineModeEnabled(channelKey);
+    if (onlineModeEnabled) {
+      const isLive = await isChannelLive(channelKey);
+      if (isLive && !isAdmin) {
+        console.log(`[${time}] Channel ${channelKey} is online and online-mode is enabled; rejecting non-admin ${username} for '${command}'`);
+        return;
+      }
+    }
+  } catch (e) {
+    console.error('Online mode check error:', e);
+  }
+
   // Enforce per-user, per-command cooldown
   try {
     const nowMs = Date.now();
@@ -919,6 +920,39 @@ client.on('message', async (channel, tags, message, self) => {
     };
   }
 
+  // Helper: check if a channel is currently streaming
+  function isChannelLive(channelName) {
+    return new Promise((resolve) => {
+      if (!helixClientId) return resolve(false);
+      const token = String(process.env.TWITCH_OAUTH || '').replace(/^oauth:/i, '');
+      const login = channelName.startsWith('#') ? channelName.slice(1) : channelName;
+      const options = {
+        hostname: 'api.twitch.tv',
+        path: `/helix/streams?user_login=${encodeURIComponent(login)}`,
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Client-Id': helixClientId
+        }
+      };
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => data += chunk);
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data || '{}');
+            if (parsed && Array.isArray(parsed.data) && parsed.data.length > 0) {
+              return resolve(true); // Stream is live
+            }
+            return resolve(false);
+          } catch (e) { return resolve(false); }
+        });
+      });
+      req.on('error', (err) => resolve(false));
+      req.end();
+    });
+  }
+
   // Resolve an argument to a UID. Accepts a numeric uid or a username; returns uid or null.
   async function resolveToUid(arg) {
     if (!arg) return null;
@@ -1153,6 +1187,22 @@ client.on('message', async (channel, tags, message, self) => {
     });
   }
 
+  // Admin-only: toggle online mode (lockdown when streamer is online)
+  if (command === 'enableonline') {
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    try {
+      const newState = await db.toggleOnlineMode(channelKey);
+      const status = newState ? 'enabled' : 'disabled';
+      queueSend(channel, `Online mode ${status}. Bot will ${newState ? 'lockdown when streamer is live' : 'run normally regardless of stream status'}.`).catch(()=>{});
+    } catch (err) {
+      console.error('Error toggling online mode:', err);
+      sendSplit(client, channel, [`Failed to toggle online mode: ${err && err.message ? err.message : err}`]).catch(()=>{});
+    }
+  }
+
   if (command === 'help') {
     // Build help lines with prefix and auth level
     const cmdLines = [];
@@ -1166,6 +1216,7 @@ client.on('message', async (channel, tags, message, self) => {
       leave: 'admin',
       addadmin: 'admin',
       rmadmin: 'admin',
+      enableonline: 'admin',
       massping: 'admin',
       ask: 'user',
       askchat: 'user',
@@ -1185,6 +1236,7 @@ client.on('message', async (channel, tags, message, self) => {
     cmdLines.push(`${pfx}leave <channel> - Leave channel (${effectiveAuth('leave')})`);
     cmdLines.push(`${pfx}addadmin <uid/user> - Add a user as admin (${effectiveAuth('addadmin')})`);
     cmdLines.push(`${pfx}rmadmin <uid/user> - Remove a user from admins (${effectiveAuth('rmadmin')})`);
+    cmdLines.push(`${pfx}enableonline - Toggle lockdown when streamer is online (${effectiveAuth('enableonline')})`);
     cmdLines.push(`${pfx}massping - send single message of recent users (${effectiveAuth('massping')})`);
     cmdLines.push(`${pfx}ask [--model MODEL] <question> - ask with recent channel chat as context (${effectiveAuth('ask')})`);
     cmdLines.push(`${pfx}askclear [username|uid] - clear your (or admin: another user's) AI conversation memory (${effectiveAuth('askclear')})`);
