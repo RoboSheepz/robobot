@@ -590,13 +590,13 @@ client.on('message', async (channel, tags, message, self) => {
     console.error('Channel auth enforcement error:', e);
   }
 
-  // Check online mode: if enabled, lock down when streamer is live
+  // Check online mode: if disabled, lock down when streamer is live
   try {
     const onlineModeEnabled = await db.getOnlineModeEnabled(channelKey);
-    if (onlineModeEnabled) {
+    if (!onlineModeEnabled) {
       const isLive = await isChannelLive(channelKey);
       if (isLive && !isAdmin) {
-        console.log(`[${time}] Channel ${channelKey} is online and online-mode is enabled; rejecting non-admin ${username} for '${command}'`);
+        console.log(`[${time}] Channel ${channelKey} is online and online-mode is disabled; rejecting non-admin ${username} for '${command}'`);
         return;
       }
     }
@@ -1187,7 +1187,7 @@ client.on('message', async (channel, tags, message, self) => {
     });
   }
 
-  // Admin-only: toggle online mode (lockdown when streamer is online)
+  // Admin-only: toggle online mode (allow bot to work when streamer is online)
   if (command === 'enableonline') {
     if (!isAdmin) {
       queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
@@ -1196,7 +1196,7 @@ client.on('message', async (channel, tags, message, self) => {
     try {
       const newState = await db.toggleOnlineMode(channelKey);
       const status = newState ? 'enabled' : 'disabled';
-      queueSend(channel, `Online mode ${status}. Bot will ${newState ? 'lockdown when streamer is live' : 'run normally regardless of stream status'}.`).catch(()=>{});
+      queueSend(channel, `Online mode ${status}. Bot will ${newState ? 'work normally when streamer is live' : 'lockdown when streamer is online'}.`).catch(()=>{});
     } catch (err) {
       console.error('Error toggling online mode:', err);
       sendSplit(client, channel, [`Failed to toggle online mode: ${err && err.message ? err.message : err}`]).catch(()=>{});
@@ -1236,7 +1236,7 @@ client.on('message', async (channel, tags, message, self) => {
     cmdLines.push(`${pfx}leave <channel> - Leave channel (${effectiveAuth('leave')})`);
     cmdLines.push(`${pfx}addadmin <uid/user> - Add a user as admin (${effectiveAuth('addadmin')})`);
     cmdLines.push(`${pfx}rmadmin <uid/user> - Remove a user from admins (${effectiveAuth('rmadmin')})`);
-    cmdLines.push(`${pfx}enableonline - Toggle lockdown when streamer is online (${effectiveAuth('enableonline')})`);
+    cmdLines.push(`${pfx}enableonline - Allow/block bot when streamer is online (${effectiveAuth('enableonline')})`);
     cmdLines.push(`${pfx}massping - send single message of recent users (${effectiveAuth('massping')})`);
     cmdLines.push(`${pfx}ask [--model MODEL] <question> - ask with recent channel chat as context (${effectiveAuth('ask')})`);
     cmdLines.push(`${pfx}askclear [username|uid] - clear your (or admin: another user's) AI conversation memory (${effectiveAuth('askclear')})`);
