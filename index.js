@@ -229,8 +229,8 @@ let lastOutgoingTs = 0;
 // recent outgoing messages to recognize echoes (message -> ts)
 const recentOutgoing = new Map();
 
-// Per-user, per-command cooldowns (ms). Default 5000ms (5s). Can be overridden via env COMMAND_COOLDOWN_MS
-const COMMAND_COOLDOWN_MS = Number(process.env.COMMAND_COOLDOWN_MS || 5000);
+// Per-user, per-command cooldowns (ms). Default 30000ms (30s). Can be overridden via env COMMAND_COOLDOWN_MS
+const COMMAND_COOLDOWN_MS = Number(process.env.COMMAND_COOLDOWN_MS || 30000);
 // Map key: `${userIdOrName}:${command}` -> last run timestamp (ms)
 const commandCooldowns = new Map();
 
@@ -419,6 +419,9 @@ const channelChatHistory = new Map();
 const CHAT_HISTORY_LIMIT = Number(process.env.CHAT_HISTORY_LIMIT || 20000); // messages
 const CHAT_HISTORY_MAX_CHARS = Number(process.env.CHAT_HISTORY_MAX_CHARS || 400000);
 
+// Per-user message stacks (for sendSplit to store remaining message chunks by UID)
+const userMessageStacks = new Map();
+
 // Helper: fetch user info from Helix by login or id. Returns parsed user obj or null.
 function fetchHelixUser({ login, id }) {
   return new Promise((resolve, reject) => {
@@ -557,12 +560,35 @@ client.on('message', async (channel, tags, message, self) => {
               } catch (e) {
                 console.error('Cooldown check error:', e);
               }
+              
+              // Check if it's a continue command
+              const firstWord = remainder.split(/\s+/)[0].toLowerCase();
+              if (firstWord === 'continue') {
+                // Handle continue command - no LLM, just send next message from stack
+                if (!mentionUserId) {
+                  queueSend(channel, `Could not determine your user ID for continue.`).catch(()=>{});
+                  return;
+                }
+                const stack = userMessageStacks.get(mentionUserId);
+                if (!stack || stack.length === 0) {
+                  queueSend(channel, `No more messages to continue.`).catch(()=>{});
+                  return;
+                }
+                const nextMessage = stack.shift();
+                if (stack.length === 0) {
+                  userMessageStacks.delete(mentionUserId);
+                }
+                queueSend(channel, nextMessage).catch(()=>{});
+                return;
+              }
+              
               // parse optional model flag
               const parsed = extractModelFlag(remainder);
               const prompt = (parsed.rest || '').trim();
               const modelOverride = parsed.model || null;
               if (prompt) {
                 const userKey = String((tags && (tags['user-id'] || tags['userId'] || tags.username || tags['display-name'])) || username || 'anonymous');
+                const userId = String(tags['user-id'] || tags['userId'] || '');
                 await handleLLMRequest({
                   channel,
                   userKey,
@@ -573,6 +599,7 @@ client.on('message', async (channel, tags, message, self) => {
                   tags,
                   time,
                   source: 'mention',
+                  userId,
                 });
               }
               return;
@@ -653,6 +680,32 @@ client.on('message', async (channel, tags, message, self) => {
     // if anything goes wrong, don't block command execution
     console.error('Cooldown check error:', e);
   }
+
+  // Reset the user's message stack whenever they send any command other than 'continue'
+  if (command !== 'continue' && userId) {
+    userMessageStacks.delete(userId);
+  }
+  
+  // Continue command: send the next part of a split message from the user's stack
+  // Usage: <prefix>continue
+  if (command === 'continue') {
+    if (!userId) {
+      queueSend(channel, `Could not determine your user ID for continue.`).catch(()=>{});
+      return;
+    }
+    const stack = userMessageStacks.get(userId);
+    if (!stack || stack.length === 0) {
+      queueSend(channel, `No more messages to continue.`).catch(()=>{});
+      return;
+    }
+    const nextMessage = stack.shift();
+    if (stack.length === 0) {
+      userMessageStacks.delete(userId);
+    }
+    queueSend(channel, nextMessage).catch(()=>{});
+    return;
+  }
+
   // Admin-only: ban a user from all commands
   // Usage: <prefix>ban <username|uid>
   if (command === 'ban') {
@@ -969,7 +1022,8 @@ client.on('message', async (channel, tags, message, self) => {
   }
 
   // Helper to send multi-part messages limited to 200 chars each
-  function sendSplit(client, channel, lines) {
+  // Now only sends the first message and stacks remaining for 'continue' command
+  function sendSplit(client, channel, lines, userId) {
     const max = 152;
     const chunks = [];
     // build chunks first
@@ -1009,12 +1063,22 @@ client.on('message', async (channel, tags, message, self) => {
       }
     }
 
-    // append '...' to non-final messages
-    const sends = chunks.map((text, idx) => {
-      const out = (idx < chunks.length - 1) ? (text + '...') : text;
-      return queueSend(channel, out);
-    });
-    return Promise.all(sends);
+    // Only send the first message and stack the rest (if userId is provided)
+    if (chunks.length === 0) {
+      return Promise.resolve();
+    }
+
+    const firstMessage = chunks[0];
+    const remainingChunks = chunks.slice(1);
+
+    // Store remaining chunks in the stack if userId is provided
+    if (userId && remainingChunks.length > 0) {
+      userMessageStacks.set(String(userId), remainingChunks);
+    }
+
+    // Send only the first message (optionally with '...' if there are more)
+    const out = (remainingChunks.length > 0) ? (firstMessage + '...') : firstMessage;
+    return queueSend(channel, out);
   }
 
   // Helper to extract the first token from a string preserving quoted tokens
@@ -1321,6 +1385,7 @@ client.on('message', async (channel, tags, message, self) => {
       tags,
       time,
       source: 'ask',
+      userId,
     });
     return;
   }
@@ -1370,7 +1435,7 @@ client.on('message', async (channel, tags, message, self) => {
   }
 
   // Helper to handle LLM requests for ask, mention, etc. (per-channel context only)
-  async function handleLLMRequest({ channel, userKey, prompt, modelOverride, channelKey, username, tags, time, source }) {
+  async function handleLLMRequest({ channel, userKey, prompt, modelOverride, channelKey, username, tags, time, source, userId }) {
     try {
       if (!prompt) return;
       const msgs = [];
@@ -1447,7 +1512,7 @@ client.on('message', async (channel, tags, message, self) => {
         if (newTotal > maxAllowed) {
           const msg = `Token limit exceeded (${newTotal}/${maxAllowed} tokens). Question too long.`;
           console.error(msg);
-          sendSplit(client, channel, ['/me grabs your throat']).catch(()=>{});
+          sendSplit(client, channel, ['/me grabs your throat'], userId).catch(()=>{});
           return;
         }
       }
@@ -1458,7 +1523,7 @@ client.on('message', async (channel, tags, message, self) => {
       const resp = await callOpenRouter(msgs, modelOverride);
       if (resp.error) {
         console.error('OpenRouter error:', resp.error);
-        sendSplit(client, channel, [`/me ignores you`]).catch(()=>{});
+        sendSplit(client, channel, [`/me ignores you`], userId).catch(()=>{});
         return;
       }
       const out = (resp.text || '').trim();
@@ -1473,7 +1538,7 @@ client.on('message', async (channel, tags, message, self) => {
         return;
       }
 
-      await sendSplit(client, channel, [out]);
+      await sendSplit(client, channel, [out], userId);
     } catch (e) {
       console.error('LLM request handler error:', e);
       queueSend(channel, `/me growls`).catch(()=>{});
