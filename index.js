@@ -544,24 +544,8 @@ client.on('message', async (channel, tags, message, self) => {
                   return;
                 }
               }
-              // Enforce per-user cooldown for mentions (treat as 'mention' command)
-              try {
-                const nowMs = Date.now();
-                const userKey = mentionUserId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
-                const cooldownKey = `${userKey}:mention`;
-                const last = commandCooldowns.get(cooldownKey) || 0;
-                if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
-                  const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
-                  console.log(`[${time}] Cooldown: user ${userKey} mentioned bot — wait ${wait}s`);
-                  return;
-                }
-                // record this invocation
-                commandCooldowns.set(cooldownKey, nowMs);
-              } catch (e) {
-                console.error('Cooldown check error:', e);
-              }
               
-              // Check if it's a continue command
+              // Check if it's a continue command FIRST (before mention cooldown)
               const firstWord = remainder.split(/\s+/)[0].toLowerCase();
               if (firstWord === 'continue') {
                 // Handle continue command - separate cooldown from mention cooldown
@@ -597,6 +581,23 @@ client.on('message', async (channel, tags, message, self) => {
                 }
                 queueSend(channel, nextMessage).catch(()=>{});
                 return;
+              }
+              
+              // Enforce per-user cooldown for mentions (treat as 'mention' command) - AFTER continue check
+              try {
+                const nowMs = Date.now();
+                const userKey = mentionUserId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+                const cooldownKey = `${userKey}:mention`;
+                const last = commandCooldowns.get(cooldownKey) || 0;
+                if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
+                  const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
+                  console.log(`[${time}] Cooldown: user ${userKey} mentioned bot — wait ${wait}s`);
+                  return;
+                }
+                // record this invocation
+                commandCooldowns.set(cooldownKey, nowMs);
+              } catch (e) {
+                console.error('Cooldown check error:', e);
               }
               
               // parse optional model flag
