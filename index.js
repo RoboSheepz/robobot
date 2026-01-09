@@ -136,6 +136,18 @@ async function processSendQueue() {
         if ((now - ts) > 60000) recentOutgoing.delete(k);
       }
       await sendAndLog(client, item.channel, messageToSend);
+      
+      // Log bot's message to database for chat history
+      try {
+        const channelKey = item.channel && item.channel.startsWith('#') ? item.channel.slice(1) : (item.channel || '');
+        const botLogin = String(process.env.TWITCH_USERNAME || opts.identity.username || '').toLowerCase();
+        if (channelKey && botLogin) {
+          await db.addChatMessage(channelKey, botLogin, String(messageToSend || ''), now);
+        }
+      } catch (e) {
+        console.error('Error logging queued bot message to DB:', e);
+      }
+      
       item.resolve();
     } catch (err) {
       item.reject(err);
