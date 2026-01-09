@@ -81,6 +81,20 @@ function sendAndRecord(channel, text) {
   for (const [k, ts] of recentOutgoing) {
     if ((now - ts) > 60000) recentOutgoing.delete(k);
   }
+  
+  // Log bot's message to database for chat history
+  try {
+    const channelKey = channel && channel.startsWith('#') ? channel.slice(1) : (channel || '');
+    const botLogin = String(process.env.TWITCH_USERNAME || opts.identity.username || '').toLowerCase();
+    if (channelKey && botLogin) {
+      db.addChatMessage(channelKey, botLogin, String(text || ''), now).catch(err => {
+        console.error('Failed persisting bot message to DB:', err);
+      });
+    }
+  } catch (e) {
+    console.error('Error logging bot message to DB:', e);
+  }
+  
   return sendAndLog(client, channel, text);
 }
 
