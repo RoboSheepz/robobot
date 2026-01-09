@@ -1438,7 +1438,7 @@ client.on('message', async (channel, tags, message, self) => {
   async function handleLLMRequest({ channel, userKey, prompt, modelOverride, channelKey, username, tags, time, source, userId }) {
     try {
       if (!prompt) return;
-      const msgs = [];
+      let msgs = [];
       if (LLM_SYSTEM_PROMPT) msgs.push({ role: 'system', content: LLM_SYSTEM_PROMPT });
       
       // Add user information from tags
@@ -1467,9 +1467,10 @@ client.on('message', async (channel, tags, message, self) => {
       // Estimate tokens for fixed parts (system + card + user prompt)
       const baseTokens = estimateMessagesTokens([...msgs, baseUserMsg]);
       const maxContext = Math.max(LLM_CONTEXT_TOKENS, 1024);
-      // Be more conservative: use 70% of available tokens for input (leaves 30% buffer)
-      const conservativeMax = Math.floor(maxContext * 0.7);
-      const availableForHistory = Math.max(0, conservativeMax - LLM_RESPONSE_TOKEN_BUFFER - baseTokens);
+      // Reserve tokens for response; remaining tokens available for input
+      const inputBudget = maxContext - LLM_RESPONSE_TOKEN_BUFFER;
+      // Use 70% of input budget for history (30% for system prompts, user info, etc)
+      const availableForHistory = Math.max(0, Math.floor(inputBudget * 0.7) - baseTokens);
       
       if (availableForHistory < 100) {
         console.warn(`Very low token budget for history: ${availableForHistory} tokens. Skipping chat history.`);
@@ -1502,15 +1503,15 @@ client.on('message', async (channel, tags, message, self) => {
 
       // Final token budget check before sending to LLM
       const totalTokens = estimateMessagesTokens(msgs);
-      const maxAllowed = conservativeMax - LLM_RESPONSE_TOKEN_BUFFER;
-      if (totalTokens > maxAllowed) {
-        console.warn(`Token budget exceeded: ${totalTokens} > ${maxAllowed}. Trimming history.`);
+      const maxInputTokens = maxContext - LLM_RESPONSE_TOKEN_BUFFER;
+      if (totalTokens > maxInputTokens) {
+        console.warn(`Token budget exceeded: ${totalTokens} > ${maxInputTokens}. Trimming history.`);
         // Remove history messages and rebuild if needed
         msgs = msgs.filter(m => m.role !== 'system' || !m.content.includes('Recent channel messages'));
         msgs.push(baseUserMsg);
         const newTotal = estimateMessagesTokens(msgs);
-        if (newTotal > maxAllowed) {
-          const msg = `Token limit exceeded (${newTotal}/${maxAllowed} tokens). Question too long.`;
+        if (newTotal > maxInputTokens) {
+          const msg = `Token limit exceeded (${newTotal}/${maxInputTokens} tokens). Question too long.`;
           console.error(msg);
           sendSplit(client, channel, ['/me grabs your throat'], userId).catch(()=>{});
           return;
