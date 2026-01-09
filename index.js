@@ -574,21 +574,24 @@ client.on('message', async (channel, tags, message, self) => {
               // Check if it's a continue command FIRST (before mention cooldown)
               const firstWord = remainder.split(/\s+/)[0].toLowerCase();
               if (firstWord === 'continue') {
-                // Handle continue command - separate cooldown from mention cooldown
-                try {
-                  const nowMs = Date.now();
-                  const userKey = mentionUserId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
-                  const cooldownKey = `${userKey}:continue`;
-                  const last = commandCooldowns.get(cooldownKey) || 0;
-                  if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
-                    const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
-                    console.log(`[${time}] Cooldown: user ${userKey} attempted 'continue' — wait ${wait}s`);
-                    return;
+                // Handle continue command - separate cooldown from mention cooldown (skip for admins)
+                const mentionIsAdmin = adminsCache.has(mentionUserId);
+                if (!mentionIsAdmin) {
+                  try {
+                    const nowMs = Date.now();
+                    const userKey = mentionUserId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+                    const cooldownKey = `${userKey}:continue`;
+                    const last = commandCooldowns.get(cooldownKey) || 0;
+                    if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
+                      const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
+                      console.log(`[${time}] Cooldown: user ${userKey} attempted 'continue' — wait ${wait}s`);
+                      return;
+                    }
+                    // record this invocation
+                    commandCooldowns.set(cooldownKey, nowMs);
+                  } catch (e) {
+                    console.error('Continue cooldown check error:', e);
                   }
-                  // record this invocation
-                  commandCooldowns.set(cooldownKey, nowMs);
-                } catch (e) {
-                  console.error('Continue cooldown check error:', e);
                 }
                 
                 // Handle continue command - no LLM, just send next message from stack
@@ -611,21 +614,24 @@ client.on('message', async (channel, tags, message, self) => {
                 return;
               }
               
-              // Enforce per-user cooldown for mentions (treat as 'mention' command) - AFTER continue check
-              try {
-                const nowMs = Date.now();
-                const userKey = mentionUserId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
-                const cooldownKey = `${userKey}:mention`;
-                const last = commandCooldowns.get(cooldownKey) || 0;
-                if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
-                  const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
-                  console.log(`[${time}] Cooldown: user ${userKey} mentioned bot — wait ${wait}s`);
-                  return;
+              // Enforce per-user cooldown for mentions (treat as 'mention' command) - AFTER continue check (skip for admins)
+              const mentionIsAdmin = adminsCache.has(mentionUserId);
+              if (!mentionIsAdmin) {
+                try {
+                  const nowMs = Date.now();
+                  const userKey = mentionUserId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+                  const cooldownKey = `${userKey}:mention`;
+                  const last = commandCooldowns.get(cooldownKey) || 0;
+                  if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
+                    const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
+                    console.log(`[${time}] Cooldown: user ${userKey} mentioned bot — wait ${wait}s`);
+                    return;
+                  }
+                  // record this invocation
+                  commandCooldowns.set(cooldownKey, nowMs);
+                } catch (e) {
+                  console.error('Cooldown check error:', e);
                 }
-                // record this invocation
-                commandCooldowns.set(cooldownKey, nowMs);
-              } catch (e) {
-                console.error('Cooldown check error:', e);
               }
               
               // parse optional model flag
@@ -709,22 +715,24 @@ client.on('message', async (channel, tags, message, self) => {
     console.error('Online mode check error:', e);
   }
 
-  // Enforce per-user, per-command cooldown
-  try {
-    const nowMs = Date.now();
-    const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
-    const cooldownKey = `${userKey}:${command}`;
-    const last = commandCooldowns.get(cooldownKey) || 0;
-    if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
-      const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
-      console.log(`[${time}] Cooldown: user ${userKey} attempted '${command}' — wait ${wait}s`);
-      return;
+  // Enforce per-user, per-command cooldown (skip for admins)
+  if (!isAdmin) {
+    try {
+      const nowMs = Date.now();
+      const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+      const cooldownKey = `${userKey}:${command}`;
+      const last = commandCooldowns.get(cooldownKey) || 0;
+      if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
+        const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
+        console.log(`[${time}] Cooldown: user ${userKey} attempted '${command}' — wait ${wait}s`);
+        return;
+      }
+      // record this invocation
+      commandCooldowns.set(cooldownKey, nowMs);
+    } catch (e) {
+      // if anything goes wrong, don't block command execution
+      console.error('Cooldown check error:', e);
     }
-    // record this invocation
-    commandCooldowns.set(cooldownKey, nowMs);
-  } catch (e) {
-    // if anything goes wrong, don't block command execution
-    console.error('Cooldown check error:', e);
   }
 
   // Reset the user's message stack whenever they send any command other than 'continue'
@@ -736,21 +744,23 @@ client.on('message', async (channel, tags, message, self) => {
   // Usage: <prefix>continue
   // Note: uses its own cooldown, not the general command cooldown
   if (command === 'continue') {
-    // Separate cooldown check for continue command
-    try {
-      const nowMs = Date.now();
-      const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
-      const cooldownKey = `${userKey}:continue`;
-      const last = commandCooldowns.get(cooldownKey) || 0;
-      if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
-        const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
-        console.log(`[${time}] Cooldown: user ${userKey} attempted 'continue' — wait ${wait}s`);
-        return;
+    // Separate cooldown check for continue command (skip for admins)
+    if (!isAdmin) {
+      try {
+        const nowMs = Date.now();
+        const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+        const cooldownKey = `${userKey}:continue`;
+        const last = commandCooldowns.get(cooldownKey) || 0;
+        if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
+          const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
+          console.log(`[${time}] Cooldown: user ${userKey} attempted 'continue' — wait ${wait}s`);
+          return;
+        }
+        // record this invocation
+        commandCooldowns.set(cooldownKey, nowMs);
+      } catch (e) {
+        console.error('Continue cooldown check error:', e);
       }
-      // record this invocation
-      commandCooldowns.set(cooldownKey, nowMs);
-    } catch (e) {
-      console.error('Continue cooldown check error:', e);
     }
     
     if (!userId) {
