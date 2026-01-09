@@ -564,6 +564,23 @@ client.on('message', async (channel, tags, message, self) => {
               // Check if it's a continue command
               const firstWord = remainder.split(/\s+/)[0].toLowerCase();
               if (firstWord === 'continue') {
+                // Handle continue command - separate cooldown from mention cooldown
+                try {
+                  const nowMs = Date.now();
+                  const userKey = mentionUserId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+                  const cooldownKey = `${userKey}:continue`;
+                  const last = commandCooldowns.get(cooldownKey) || 0;
+                  if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
+                    const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
+                    console.log(`[${time}] Cooldown: user ${userKey} attempted 'continue' — wait ${wait}s`);
+                    return;
+                  }
+                  // record this invocation
+                  commandCooldowns.set(cooldownKey, nowMs);
+                } catch (e) {
+                  console.error('Continue cooldown check error:', e);
+                }
+                
                 // Handle continue command - no LLM, just send next message from stack
                 if (!mentionUserId) {
                   queueSend(channel, `Could not determine your user ID for continue.`).catch(()=>{});
@@ -688,7 +705,25 @@ client.on('message', async (channel, tags, message, self) => {
   
   // Continue command: send the next part of a split message from the user's stack
   // Usage: <prefix>continue
+  // Note: uses its own cooldown, not the general command cooldown
   if (command === 'continue') {
+    // Separate cooldown check for continue command
+    try {
+      const nowMs = Date.now();
+      const userKey = userId || String((tags && (tags.username || tags['display-name'])) || username || 'anonymous');
+      const cooldownKey = `${userKey}:continue`;
+      const last = commandCooldowns.get(cooldownKey) || 0;
+      if ((nowMs - last) < COMMAND_COOLDOWN_MS) {
+        const wait = Math.ceil((COMMAND_COOLDOWN_MS - (nowMs - last)) / 1000);
+        console.log(`[${time}] Cooldown: user ${userKey} attempted 'continue' — wait ${wait}s`);
+        return;
+      }
+      // record this invocation
+      commandCooldowns.set(cooldownKey, nowMs);
+    } catch (e) {
+      console.error('Continue cooldown check error:', e);
+    }
+    
     if (!userId) {
       queueSend(channel, `Could not determine your user ID for continue.`).catch(()=>{});
       return;
