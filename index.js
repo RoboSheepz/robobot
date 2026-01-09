@@ -590,10 +590,12 @@ client.on('message', async (channel, tags, message, self) => {
                   return;
                 }
                 const nextMessage = stack.shift();
+                const hasMore = stack.length > 0;
                 if (stack.length === 0) {
                   userMessageStacks.delete(mentionUserId);
                 }
-                queueSend(channel, nextMessage).catch(()=>{});
+                const outMessage = hasMore ? (nextMessage + '...') : nextMessage;
+                queueSend(channel, outMessage).catch(()=>{});
                 return;
               }
               
@@ -749,10 +751,12 @@ client.on('message', async (channel, tags, message, self) => {
       return;
     }
     const nextMessage = stack.shift();
+    const hasMore = stack.length > 0;
     if (stack.length === 0) {
       userMessageStacks.delete(userId);
     }
-    queueSend(channel, nextMessage).catch(()=>{});
+    const outMessage = hasMore ? (nextMessage + '...') : nextMessage;
+    queueSend(channel, outMessage).catch(()=>{});
     return;
   }
 
