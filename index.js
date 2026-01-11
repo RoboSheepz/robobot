@@ -1431,7 +1431,7 @@ client.on('message', async (channel, tags, message, self) => {
       const cmd = helpArg.toLowerCase().replace(/^!/, '');
       const detailed = detailedHelp[cmd];
       if (detailed) {
-        sendWhisperSplit(username, [detailed]).catch(err => console.error('Help whisper error:', err));
+        sendSplit(client, channel, [detailed]).catch(err => console.error('Help error:', err));
       } else {
         queueSend(channel, `Unknown command '${cmd}'. Type ${pfx}help for available commands.`).catch(()=>{});
       }
@@ -1440,7 +1440,7 @@ client.on('message', async (channel, tags, message, self) => {
       const cmdNames = Object.keys(detailedHelp).sort();
       const cmdList = cmdNames.map(cmd => `${pfx}${cmd}`).join(', ');
       const helpMsg = `Available commands: ${cmdList}\nType ${pfx}help <command> for details.`;
-      sendWhisperSplit(username, [helpMsg]).catch(err => console.error('Help whisper error:', err));
+      sendSplit(client, channel, [helpMsg]).catch(err => console.error('Help error:', err));
     }
   }
 
