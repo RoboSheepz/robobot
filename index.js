@@ -9,6 +9,7 @@ const path = require('path');
 const http = require('http');
 // Global message queue settings
 const MESSAGE_INTERVAL_MS = Number(process.env.MESSAGE_INTERVAL_MS || 1100);
+const DEFAULT_MAX_MESSAGE_LENGTH = Number(process.env.DEFAULT_MESSAGE_LENGTH || 152);
 
 // Banphrase API configuration
 const BANPHRASE_API_URL = process.env.BANPHRASE_API_URL || 'https://pajlada.pajbot.com/api/v1/banphrases/test';
@@ -1100,7 +1101,9 @@ client.on('message', async (channel, tags, message, self) => {
   // Helper to send multi-part messages limited to 200 chars each
   // Now only sends the first message and stacks remaining for 'continue' command
   function sendSplit(client, channel, lines, userId) {
-    const max = 152;
+    const channelKey = channel && channel.startsWith('#') ? channel.slice(1) : (channel || '');
+    const chanCfg = channelsCache.get(channelKey) || { prefix: '!', require_admin: false, max_message_length: DEFAULT_MAX_MESSAGE_LENGTH };
+    const max = chanCfg.max_message_length || DEFAULT_MAX_MESSAGE_LENGTH;
     const chunks = [];
     // build chunks first
     for (const line of lines) {
@@ -1344,16 +1347,43 @@ client.on('message', async (channel, tags, message, self) => {
     }
   }
 
+  // Admin-only: set message length for current channel
+  // Usage: <prefix>setmsglen <length>
+  if (command === 'setmsglen') {
+    if (!isAdmin) {
+      queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
+      return;
+    }
+    const lengthStr = parts[1];
+    if (!lengthStr || !/^\d+$/.test(lengthStr)) {
+      queueSend(channel, `Usage: ${prefix}setmsglen <length_in_chars>`).catch(()=>{});
+      return;
+    }
+    const newLen = Math.max(50, Math.min(500, Number(lengthStr))); // Clamp between 50-500
+    const existing = channelsCache.get(channelKey) || { prefix: '!', require_admin: false, max_message_length: DEFAULT_MAX_MESSAGE_LENGTH };
+    db.addChannel(channelKey, existing.prefix, existing.require_admin, newLen)
+      .then(() => {
+        channelsCache.set(channelKey, { ...existing, max_message_length: newLen });
+        queueSend(channel, `Message length for ${channelKey} set to ${newLen} characters.`).catch(()=>{});
+      })
+      .catch(err => {
+        console.error('Error setting message length:', err);
+        sendSplit(client, channel, [`Failed to set message length: ${err && err.message ? err.message : err}`]).catch(()=>{});
+      });
+    return;
+  }
+
   if (command === 'help') {
-    // Build help lines with prefix and auth level
-    const cmdLines = [];
     const pfx = prefix;
+    const helpArg = parts[1];
+    
     // default auth per-command
     const defaultAuth = {
       ping: 'user',
       uid: 'user',
       join: 'admin',
       setprefix: 'admin',
+      setmsglen: 'admin',
       leave: 'admin',
       addadmin: 'admin',
       rmadmin: 'admin',
@@ -1363,33 +1393,55 @@ client.on('message', async (channel, tags, message, self) => {
       askchat: 'user',
       askclear: 'user',
       lockdown: 'admin',
-      setprompt: 'admin',      // NEW
-      addchar: 'admin'         // NEW
+      setprompt: 'admin',
+      addchar: 'admin',
+      ban: 'admin',
+      unban: 'admin',
+      say: 'admin'
     };
 
     // if channel enforces admin for all commands, override default
     const effectiveAuth = (cmd) => (chanCfg && chanCfg.require_admin) ? 'admin' : (defaultAuth[cmd] || 'user');
 
-    cmdLines.push(`${pfx}ping - ping the bot (${effectiveAuth('ping')})`);
-    cmdLines.push(`${pfx}uid <uid/user> - return Twitch user or UID (${effectiveAuth('uid')})`);
-    cmdLines.push(`${pfx}join <channel> [prefix] [admin] - Join channel and set prefix (${effectiveAuth('join')})`);
-    cmdLines.push(`${pfx}setprefix <prefix> - Set this channel's prefix (${effectiveAuth('setprefix')})`);
-    cmdLines.push(`${pfx}leave <channel> - Leave channel (${effectiveAuth('leave')})`);
-    cmdLines.push(`${pfx}addadmin <uid/user> - Add a user as admin (${effectiveAuth('addadmin')})`);
-    cmdLines.push(`${pfx}rmadmin <uid/user> - Remove a user from admins (${effectiveAuth('rmadmin')})`);
-    cmdLines.push(`${pfx}enableonline - Allow/block bot when streamer is online (${effectiveAuth('enableonline')})`);
-    cmdLines.push(`${pfx}massping - send single message of recent users (${effectiveAuth('massping')})`);
-    cmdLines.push(`${pfx}ask [--model MODEL] <question> - ask with recent channel chat as context (${effectiveAuth('ask')})`);
-    cmdLines.push(`${pfx}askclear [username|uid] - clear your (or admin: another user's) AI conversation memory (${effectiveAuth('askclear')})`);
-    cmdLines.push(`${pfx}lockdown [on|off|toggle] [--channel <ch>|-c <ch>] [--all|-a] - restrict commands to admins (${effectiveAuth('lockdown')})`);
-    cmdLines.push(`${pfx}ban <username|uid> - Ban user from all bot commands (admin)`);
-    cmdLines.push(`${pfx}unban <username|uid> - Unban user (admin)`);
-    cmdLines.push(`${pfx}say [--channel <channel>] <message> - Make the bot say something (admin)`);
-    cmdLines.push(`${pfx}setprompt <text> - Update the system prompt used for AI (admin)`); // NEW
-    cmdLines.push(`${pfx}addchar <png-url> - Download a PNG character card and set active (admin)`); // NEW
-    
-    // Send help via whisper instead of channel
-    sendWhisperSplit(username, cmdLines).catch(err => console.error('Help whisper error:', err));
+    // detailed help per-command
+    const detailedHelp = {
+      ping: `${pfx}ping - ping the bot (${effectiveAuth('ping')})`,
+      uid: `${pfx}uid <uid/user> - return Twitch user or UID (${effectiveAuth('uid')})`,
+      join: `${pfx}join <channel> [prefix] [admin] - Join channel and set prefix (${effectiveAuth('join')})`,
+      setprefix: `${pfx}setprefix <prefix> - Set this channel's prefix (${effectiveAuth('setprefix')})`,
+      setmsglen: `${pfx}setmsglen <length> - Set max message length in chars (50-500) (${effectiveAuth('setmsglen')})`,
+      leave: `${pfx}leave <channel> - Leave channel (${effectiveAuth('leave')})`,
+      addadmin: `${pfx}addadmin <uid/user> - Add a user as admin (${effectiveAuth('addadmin')})`,
+      rmadmin: `${pfx}rmadmin <uid/user> - Remove a user from admins (${effectiveAuth('rmadmin')})`,
+      enableonline: `${pfx}enableonline - Allow/block bot when streamer is online (${effectiveAuth('enableonline')})`,
+      massping: `${pfx}massping - send single message of recent users (${effectiveAuth('massping')})`,
+      ask: `${pfx}ask [--model MODEL] <question> - ask with recent channel chat as context (${effectiveAuth('ask')})`,
+      askchat: `${pfx}askchat - print recent chat context (${effectiveAuth('askchat')})`,
+      askclear: `${pfx}askclear [username|uid] - clear your (or admin: another user's) AI conversation memory (${effectiveAuth('askclear')})`,
+      lockdown: `${pfx}lockdown [on|off|toggle] [--channel <ch>|-c <ch>] [--all|-a] - restrict commands to admins (${effectiveAuth('lockdown')})`,
+      ban: `${pfx}ban <username|uid> - Ban user from all bot commands (${effectiveAuth('ban')})`,
+      unban: `${pfx}unban <username|uid> - Unban user (${effectiveAuth('unban')})`,
+      say: `${pfx}say [--channel <channel>] <message> - Make the bot say something (${effectiveAuth('say')})`,
+      setprompt: `${pfx}setprompt <text> - Update the system prompt used for AI (${effectiveAuth('setprompt')})`,
+      addchar: `${pfx}addchar <png-url> - Download a PNG character card and set active (${effectiveAuth('addchar')})`
+    };
+
+    if (helpArg) {
+      // Show detailed help for specific command
+      const cmd = helpArg.toLowerCase().replace(/^!/, '');
+      const detailed = detailedHelp[cmd];
+      if (detailed) {
+        sendWhisperSplit(username, [detailed]).catch(err => console.error('Help whisper error:', err));
+      } else {
+        queueSend(channel, `Unknown command '${cmd}'. Type ${pfx}help for available commands.`).catch(()=>{});
+      }
+    } else {
+      // Show list of command names
+      const cmdNames = Object.keys(detailedHelp).sort();
+      const cmdList = cmdNames.map(cmd => `${pfx}${cmd}`).join(', ');
+      const helpMsg = `Available commands: ${cmdList}\nType ${pfx}help <command> for details.`;
+      sendWhisperSplit(username, [helpMsg]).catch(err => console.error('Help whisper error:', err));
+    }
   }
 
   if (command === 'uid') {
@@ -1635,11 +1687,11 @@ client.on('message', async (channel, tags, message, self) => {
     }
     // update DB and cache for this channel
     const normalized = channelKey;
-    const existing = channelsCache.get(normalized) || { prefix: newPrefix, require_admin: false };
-    db.addChannel(normalized, newPrefix, existing.require_admin)
+    const existing = channelsCache.get(normalized) || { prefix: newPrefix, require_admin: false, max_message_length: DEFAULT_MAX_MESSAGE_LENGTH };
+    db.addChannel(normalized, newPrefix, existing.require_admin, existing.max_message_length)
       .then(() => {
         // preserve existing require_admin setting when only updating prefix
-        channelsCache.set(normalized, { prefix: newPrefix, require_admin: existing.require_admin });
+        channelsCache.set(normalized, { prefix: newPrefix, require_admin: existing.require_admin, max_message_length: existing.max_message_length });
         sendAndRecord(channel, `Prefix for ${normalized} set to '${newPrefix}'`).catch(()=>{});
       })
       .catch(err => {

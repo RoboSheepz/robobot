@@ -55,6 +55,7 @@ function init() {
           return;
         }
         const hasRequire = Array.isArray(cols) && cols.some(c => c && c.name === 'require_admin');
+        const hasMaxLength = Array.isArray(cols) && cols.some(c => c && c.name === 'max_message_length');
         const doAfterMigration = () => {
           // Ensure initial admin and default channel if configured via environment
           if (defaultAdmin) {
@@ -70,11 +71,26 @@ function init() {
           db.close((err) => err ? reject(err) : resolve());
         };
 
+        const migrations = [];
         if (!hasRequire) {
-          db.run(`ALTER TABLE channels ADD COLUMN require_admin INTEGER DEFAULT 0`, [], (alterErr) => {
-            if (alterErr) console.error('Failed to add require_admin column:', alterErr && alterErr.message ? alterErr.message : alterErr);
-            doAfterMigration();
-          });
+          migrations.push(new Promise((res) => {
+            db.run(`ALTER TABLE channels ADD COLUMN require_admin INTEGER DEFAULT 0`, [], (alterErr) => {
+              if (alterErr) console.error('Failed to add require_admin column:', alterErr && alterErr.message ? alterErr.message : alterErr);
+              res();
+            });
+          }));
+        }
+        if (!hasMaxLength) {
+          migrations.push(new Promise((res) => {
+            db.run(`ALTER TABLE channels ADD COLUMN max_message_length INTEGER DEFAULT 152`, [], (alterErr) => {
+              if (alterErr) console.error('Failed to add max_message_length column:', alterErr && alterErr.message ? alterErr.message : alterErr);
+              res();
+            });
+          }));
+        }
+
+        if (migrations.length > 0) {
+          Promise.all(migrations).then(() => doAfterMigration());
         } else {
           doAfterMigration();
         }
@@ -134,20 +150,21 @@ function loadAdmins() {
 function loadChannels() {
   return new Promise((resolve, reject) => {
     const db = openDb();
-    db.all(`SELECT channel, prefix, require_admin FROM channels`, [], (err, rows) => {
+    db.all(`SELECT channel, prefix, require_admin, max_message_length FROM channels`, [], (err, rows) => {
       db.close();
       if (err) return reject(err);
-      const map = new Map(rows.map(r => [String(r.channel), { prefix: r.prefix || '!', require_admin: !!r.require_admin }]));
+      const map = new Map(rows.map(r => [String(r.channel), { prefix: r.prefix || '!', require_admin: !!r.require_admin, max_message_length: r.max_message_length || 152 }]));
       resolve(map);
     });
   });
 }
 
-function addChannel(channel, prefix, requireAdmin) {
+function addChannel(channel, prefix, requireAdmin, maxMessageLength) {
   return new Promise((resolve, reject) => {
     const db = openDb();
     const req = requireAdmin ? 1 : 0;
-    db.run(`INSERT OR REPLACE INTO channels(channel, prefix, require_admin) VALUES(?,?,?)`, [channel, prefix, req], function(err) {
+    const msgLen = maxMessageLength || 152;
+    db.run(`INSERT OR REPLACE INTO channels(channel, prefix, require_admin, max_message_length) VALUES(?,?,?,?)`, [channel, prefix, req, msgLen], function(err) {
       db.close();
       if (err) return reject(err);
       resolve();
