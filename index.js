@@ -834,7 +834,7 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
-    let text = withoutPrefix.slice(command.length).trim();
+    let text = parts.slice(1).join(' ').trim();
     let targetChannel = channel;
     
     // Check for --channel flag
@@ -860,7 +860,7 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
-    const newPrompt = withoutPrefix.slice(command.length).trim();
+    const newPrompt = parts.slice(1).join(' ').trim();
     if (!newPrompt) {
       queueSend(channel, `Usage: ${prefix}setprompt <text>`).catch(()=>{});
       return;
@@ -882,7 +882,7 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
-    const raw = withoutPrefix.slice(command.length).trim();
+    const raw = parts.slice(1).join(' ').trim();
     const first = extractFirstTokenPreservingQuotes(raw);
     const url = first.token;
     if (!url) {
@@ -1236,7 +1236,7 @@ client.on('message', async (channel, tags, message, self) => {
       return;
     }
     // parse target and optional prefix (prefix may be quoted to include spaces)
-    const remainderAfterCommand = withoutPrefix.slice(command.length).trim();
+    const remainderAfterCommand = parts.slice(1).join(' ').trim();
     const first = extractFirstTokenPreservingQuotes(remainderAfterCommand);
     const target = first.token;
     if (!target) {
@@ -1494,7 +1494,7 @@ client.on('message', async (channel, tags, message, self) => {
 
   // Ask LLM including recent channel chat history as context: <prefix>ask <prompt>
   if (command === 'ask' || command === 'ai') {
-    const raw = withoutPrefix.slice(command.length).trim();
+    const raw = parts.slice(1).join(' ').trim();
     const parsed = extractModelFlag(raw);
     const prompt = (parsed.rest || '').trim();
     const modelOverride = parsed.model || null;
@@ -1520,7 +1520,7 @@ client.on('message', async (channel, tags, message, self) => {
 
   // Clear conversation memory: askclear [username|uid]
   if (command === 'askclear') {
-    const raw = withoutPrefix.slice(command.length).trim();
+    const raw = parts.slice(1).join(' ').trim();
     const first = extractFirstTokenPreservingQuotes(raw || '');
     const target = first.token || null;
     // If no target provided, allow user to clear their own memory
@@ -1647,7 +1647,7 @@ client.on('message', async (channel, tags, message, self) => {
       }
 
       // Log the entire messages array sent to LLM
-      console.log(`LLM REQUEST (${source || 'unknown'}, all prompt/context):`, JSON.stringify(msgs, null, 2));
+      console.log(`LLM REQUEST (${source || 'unknown'}, model: ${modelOverride || 'default'}, all prompt/context):`, JSON.stringify(msgs, null, 2));
 
       const resp = await callOpenRouter(msgs, modelOverride);
       if (resp.error) {
@@ -1707,7 +1707,7 @@ client.on('message', async (channel, tags, message, self) => {
       queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
       return;
     }
-    const raw = withoutPrefix.slice(command.length).trim();
+    const raw = parts.slice(1).join(' ').trim();
     const parts2 = raw.split(/\s+/);
     
     // Parse state (on/off/toggle)
