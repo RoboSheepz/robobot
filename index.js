@@ -312,34 +312,14 @@ function readPositiveIntegerEnv(name, fallback) {
 const LLM_CONTEXT_TOKENS = readPositiveIntegerEnv('LLM_CONTEXT_TOKENS', 8192);
 const LLM_RESPONSE_TOKEN_BUFFER = readPositiveIntegerEnv('LLM_RESPONSE_TOKEN_BUFFER', 1024);
 
-// Token estimation helpers (OpenRouter can route to models with different tokenizers,
-// so keep the fallback conservative rather than assuming four characters per token.)
-let tkEncoder = null;
-function tryInitTokenizer() {
-  if (tkEncoder !== null) return;
-  try {
-    // Lazy load tokenizer if available
-    const { encoding_for_model } = require('@dqbd/tiktoken');
-    // Use cl100k_base-compatible model name for approximation
-    tkEncoder = encoding_for_model('gpt-4o-mini');
-  } catch (e) {
-    tkEncoder = false; // mark unavailable
-  }
-}
-
+// Conservative token upper-bound estimate. UTF-8 byte count avoids assuming a
+// tokenizer/model that may not match the configured inference endpoint.
 function estimateTokensForText(text) {
   const s = String(text || '');
   if (!s) return 0;
-  tryInitTokenizer();
-  try {
-    if (tkEncoder) {
-      const tokens = tkEncoder.encode(s);
-      return tokens.length;
-    }
-  } catch (_) {}
-  // Two characters per token is intentionally conservative for non-GPT tokenizers
-  // and token-dense chat text (emotes, Unicode, code, and short fragments).
-  return Math.ceil(s.length / 2);
+  // Byte-level tokenizers cannot produce more tokens than input bytes; this is
+  // intentionally an upper bound for dense chat text, Unicode, and custom models.
+  return Buffer.byteLength(s, 'utf8');
 }
 
 function estimateMessagesTokens(messages) {
@@ -347,8 +327,8 @@ function estimateMessagesTokens(messages) {
   let total = 0;
   for (const m of messages) {
     total += estimateTokensForText(m && m.content ? m.content : '');
-    // add small overhead per message for roles/formatting
-    total += 4;
+    // Allow for role/separator formatting added by chat-completions serialization.
+    total += 16;
   }
   return total;
 }
@@ -1627,14 +1607,20 @@ client.on('message', async (channel, tags, message, self) => {
       const maxContext = Math.max(LLM_CONTEXT_TOKENS, 1024);
       // Keep at least half the context for input, even if the configured output reserve is larger.
       const responseTokenBudget = Math.min(LLM_RESPONSE_TOKEN_BUFFER, Math.max(1, Math.floor(maxContext / 2)));
-      const maxInputTokens = maxContext - responseTokenBudget;
+      // Hold back 5% (at least 256 tokens) for provider-specific message framing and tokenizer differences.
+      const contextSafetyMargin = Math.max(256, Math.ceil(maxContext * 0.05));
+      const maxInputTokens = maxContext - responseTokenBudget - contextSafetyMargin;
       const baseTokens = estimateMessagesTokens([...msgs, baseUserMsg]);
       if (baseTokens > maxInputTokens) {
         console.warn(`Prompt and fixed context exceed input budget: ${baseTokens} > ${maxInputTokens} tokens.`);
         sendSplit(client, channel, [`Prompt and system context exceed the ${maxInputTokens}-token input budget.`], userId).catch(()=>{});
         return;
       }
-      const availableForHistory = maxInputTokens - baseTokens;
+      // History may use at most 30% of input capacity; never let it crowd out the prompt.
+      const availableForHistory = Math.min(
+        maxInputTokens - baseTokens,
+        Math.floor(maxInputTokens * 0.3)
+      );
 
       // Retrieve recent chat history from DB (persistent) without char trimming
       let histRows = [];
@@ -1650,7 +1636,7 @@ client.on('message', async (channel, tags, message, self) => {
         for (const entry of histRows) {
           const line = `${entry.user}: ${entry.text}\n`;
           const candidateHistory = { role: 'system', content: `Recent channel messages:\n${line}${selectedHistory}` };
-          if (estimateMessagesTokens([...msgs, candidateHistory, baseUserMsg]) <= maxInputTokens) {
+          if (estimateMessagesTokens([...msgs, candidateHistory, baseUserMsg]) <= baseTokens + availableForHistory) {
             selectedHistory = line + selectedHistory;
           }
         }
@@ -1660,7 +1646,7 @@ client.on('message', async (channel, tags, message, self) => {
       msgs.push(baseUserMsg);
 
       const totalTokens = estimateMessagesTokens(msgs);
-      console.log(`LLM token budget: input ${totalTokens}/${maxInputTokens}, response reserve ${responseTokenBudget}, context ${maxContext}.`);
+      console.log(`LLM token budget: input ${totalTokens}/${maxInputTokens}, response reserve ${responseTokenBudget}, safety margin ${contextSafetyMargin}, history cap ${availableForHistory}, context ${maxContext}.`);
 
       // Log the entire messages array sent to LLM
       console.log(`LLM REQUEST (${source || 'unknown'}, model: ${modelOverride || 'default'}, all prompt/context):`, JSON.stringify(msgs, null, 2));
