@@ -295,17 +295,25 @@ async function unbanUser(uid) {
 // OpenRouter LLM configuration
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'gpt-4o-mini';
-const OPENROUTER_URL = process.env.OPENROUTER_URL || 'https://api.openrouter.ai/v1/chat/completions';
+const OPENROUTER_URL = (process.env.OPENROUTER_URL || 'https://openrouter.ai/api/v1')
+  .replace(/\/chat\/completions\/?$/i, '')
+  .replace(/\/+$/, '');
 // Optional system prompt / extra context to include with every LLM call
 let LLM_SYSTEM_PROMPT = null; // Will be loaded from data/prompt.txt
 // Optional character card (JanitorAI PNG format)
 let LLM_CHARACTER_CARD = process.env.LLM_CHARACTER_CARD || null; // CHANGED: let
 let characterCardData = null;
 // LLM context budgeting (tokens)
-const LLM_CONTEXT_TOKENS = Number(process.env.LLM_CONTEXT_TOKENS || 8192);
-const LLM_RESPONSE_TOKEN_BUFFER = Number(process.env.LLM_RESPONSE_TOKEN_BUFFER || 8192);
+function readPositiveIntegerEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
 
-// Token estimation helpers (tries tiktoken; falls back to chars/4)
+const LLM_CONTEXT_TOKENS = readPositiveIntegerEnv('LLM_CONTEXT_TOKENS', 8192);
+const LLM_RESPONSE_TOKEN_BUFFER = readPositiveIntegerEnv('LLM_RESPONSE_TOKEN_BUFFER', 1024);
+
+// Token estimation helpers (OpenRouter can route to models with different tokenizers,
+// so keep the fallback conservative rather than assuming four characters per token.)
 let tkEncoder = null;
 function tryInitTokenizer() {
   if (tkEncoder !== null) return;
@@ -329,8 +337,9 @@ function estimateTokensForText(text) {
       return tokens.length;
     }
   } catch (_) {}
-  // Fallback heuristic: ~4 chars per token
-  return Math.ceil(s.length / 4);
+  // Two characters per token is intentionally conservative for non-GPT tokenizers
+  // and token-dense chat text (emotes, Unicode, code, and short fragments).
+  return Math.ceil(s.length / 2);
 }
 
 function estimateMessagesTokens(messages) {
@@ -907,14 +916,8 @@ client.on('message', async (channel, tags, message, self) => {
   // Helper: call OpenRouter using the official SDK and stream results
   // callOpenRouter accepts either a prompt string or an array of messages [{role,content},...]
   // and an optional model override string as second argument
-  async function callOpenRouter(input, modelOverride) {
+  async function callOpenRouter(input, modelOverride, maxTokens) {
     if (!OPENROUTER_API_KEY) return { error: { message: 'No OPENROUTER_API_KEY configured' } };
-    let OpenRouter;
-    try {
-      OpenRouter = require('@openrouter/sdk').OpenRouter;
-    } catch (e) {
-      return { error: { message: 'Missing @openrouter/sdk. Install with: npm install @openrouter/sdk' } };
-    }
 
     // Timeout wrapper - 30 seconds
     const timeoutPromise = new Promise((resolve) => {
@@ -925,41 +928,70 @@ client.on('message', async (channel, tags, message, self) => {
 
     const llmPromise = (async () => {
       try {
-        const or = new OpenRouter({ apiKey: OPENROUTER_API_KEY });
         const messages = Array.isArray(input) ? input.map(m => ({ role: m.role, content: String(m.content) })) : [{ role: 'user', content: String(input) }];
-        const stream = await or.chat.send({
-          model: modelOverride || OPENROUTER_MODEL,
-          messages,
-          stream: true,
-          streamOptions: { includeUsage: true }
+        const response = await fetch(`${OPENROUTER_URL}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream, application/json'
+          },
+          body: JSON.stringify({
+            model: modelOverride || OPENROUTER_MODEL,
+            messages,
+            max_tokens: maxTokens,
+            stream: true,
+            stream_options: { include_usage: true }
+          })
         });
 
-        let response = '';
-        let usage = null;
-        let isFirstChunk = true;
-        for await (const chunk of stream) {
-          // Check if this looks like an error response instead of a stream chunk
-          if (isFirstChunk) {
-            isFirstChunk = false;
-            // If chunk is missing expected stream fields, it might be an error
-            if (!chunk || (!chunk.choices && !chunk.data)) {
-              console.warn('Unexpected chunk structure, may be error:', chunk);
-            }
-          }
-          
-          let content = null;
-          const choices = chunk && chunk.choices;
-          const first = choices && choices[0];
-          if (first) {
-            if (first.delta && first.delta.content) content = first.delta.content;
-            else if (first.message && first.message.content) content = first.message.content;
-            else if (first.text) content = first.text;
-          }
-          if (content) response += content;
-          if (chunk && chunk.usage) usage = chunk.usage;
+        if (!response.ok) {
+          const body = await response.text();
+          const err = new Error(`OpenRouter request failed (${response.status})`);
+          err.status = response.status;
+          err.body = body;
+          throw err;
         }
 
-        return { text: String(response), usage };
+        let responseText = '';
+        let usage = null;
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+        if (contentType.includes('text/event-stream')) {
+          const decoder = new TextDecoder();
+          let buffer = '';
+          const consumeSSELine = (line) => {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) return;
+            const data = trimmed.slice(5).trim();
+            if (!data || data === '[DONE]') return;
+            const chunk = JSON.parse(data);
+            if (chunk.error) throw new Error(chunk.error.message || JSON.stringify(chunk.error));
+            const choice = chunk.choices && chunk.choices[0];
+            const content = choice && choice.delta && choice.delta.content;
+            if (typeof content === 'string') responseText += content;
+            if (chunk.usage) usage = chunk.usage;
+          };
+
+          for await (const bytes of response.body) {
+            buffer += decoder.decode(bytes, { stream: true });
+            let newline;
+            while ((newline = buffer.indexOf('\n')) !== -1) {
+              consumeSSELine(buffer.slice(0, newline).replace(/\r$/, ''));
+              buffer = buffer.slice(newline + 1);
+            }
+          }
+          buffer += decoder.decode();
+          if (buffer.trim()) consumeSSELine(buffer.replace(/\r$/, ''));
+        } else {
+          const payload = await response.json();
+          if (payload.error) throw new Error(payload.error.message || JSON.stringify(payload.error));
+          const choice = payload.choices && payload.choices[0];
+          const content = choice && ((choice.message && choice.message.content) || choice.text);
+          if (typeof content === 'string') responseText = content;
+          if (payload.usage) usage = payload.usage;
+        }
+
+        return { text: responseText, usage };
       } catch (err) {
         // Build a structured error object with common fields
         try {
@@ -1592,17 +1624,17 @@ client.on('message', async (channel, tags, message, self) => {
       // Only include per-channel context (no per-user conversation)
       // Budget history by model token window
       let baseUserMsg = { role: 'user', content: prompt };
-      // Estimate tokens for fixed parts (system + card + user prompt)
-      const baseTokens = estimateMessagesTokens([...msgs, baseUserMsg]);
       const maxContext = Math.max(LLM_CONTEXT_TOKENS, 1024);
-      // Reserve tokens for response; remaining tokens available for input
-      const inputBudget = maxContext - LLM_RESPONSE_TOKEN_BUFFER;
-      // Use 70% of input budget for history (30% for system prompts, user info, etc)
-      const availableForHistory = Math.max(0, Math.floor(inputBudget * 0.7) - baseTokens);
-      
-      if (availableForHistory < 100) {
-        console.warn(`Very low token budget for history: ${availableForHistory} tokens. Skipping chat history.`);
+      // Keep at least half the context for input, even if the configured output reserve is larger.
+      const responseTokenBudget = Math.min(LLM_RESPONSE_TOKEN_BUFFER, Math.max(1, Math.floor(maxContext / 2)));
+      const maxInputTokens = maxContext - responseTokenBudget;
+      const baseTokens = estimateMessagesTokens([...msgs, baseUserMsg]);
+      if (baseTokens > maxInputTokens) {
+        console.warn(`Prompt and fixed context exceed input budget: ${baseTokens} > ${maxInputTokens} tokens.`);
+        sendSplit(client, channel, [`Prompt and system context exceed the ${maxInputTokens}-token input budget.`], userId).catch(()=>{});
+        return;
       }
+      const availableForHistory = maxInputTokens - baseTokens;
 
       // Retrieve recent chat history from DB (persistent) without char trimming
       let histRows = [];
@@ -1613,43 +1645,27 @@ client.on('message', async (channel, tags, message, self) => {
       }
 
       if (histRows && histRows.length && availableForHistory > 0) {
-        // Build from oldest to newest until token budget is exhausted
-        let histText = '';
-        let histTokens = 0;
-        for (let i = histRows.length - 1; i >= 0; i--) {
-          const entry = histRows[i];
+        // DB rows are newest-first; retain the newest messages that fit, then render chronologically.
+        let selectedHistory = '';
+        for (const entry of histRows) {
           const line = `${entry.user}: ${entry.text}\n`;
-          const lineTokens = estimateTokensForText(line);
-          if ((histTokens + lineTokens) > availableForHistory) break;
-          histTokens += lineTokens;
-          histText += line;
+          const candidateHistory = { role: 'system', content: `Recent channel messages:\n${line}${selectedHistory}` };
+          if (estimateMessagesTokens([...msgs, candidateHistory, baseUserMsg]) <= maxInputTokens) {
+            selectedHistory = line + selectedHistory;
+          }
         }
-        if (histText) msgs.push({ role: 'system', content: `Recent channel messages:\n${histText}` });
+        if (selectedHistory) msgs.push({ role: 'system', content: `Recent channel messages:\n${selectedHistory}` });
       }
 
       msgs.push(baseUserMsg);
 
-      // Final token budget check before sending to LLM
       const totalTokens = estimateMessagesTokens(msgs);
-      const maxInputTokens = maxContext - LLM_RESPONSE_TOKEN_BUFFER;
-      if (totalTokens > maxInputTokens) {
-        console.warn(`Token budget exceeded: ${totalTokens} > ${maxInputTokens}. Trimming history.`);
-        // Remove history messages and rebuild if needed
-        msgs = msgs.filter(m => m.role !== 'system' || !m.content.includes('Recent channel messages'));
-        msgs.push(baseUserMsg);
-        const newTotal = estimateMessagesTokens(msgs);
-        if (newTotal > maxInputTokens) {
-          const msg = `Token limit exceeded (${newTotal}/${maxInputTokens} tokens). Question too long.`;
-          console.error(msg);
-          sendSplit(client, channel, ['/me grabs your throat'], userId).catch(()=>{});
-          return;
-        }
-      }
+      console.log(`LLM token budget: input ${totalTokens}/${maxInputTokens}, response reserve ${responseTokenBudget}, context ${maxContext}.`);
 
       // Log the entire messages array sent to LLM
       console.log(`LLM REQUEST (${source || 'unknown'}, model: ${modelOverride || 'default'}, all prompt/context):`, JSON.stringify(msgs, null, 2));
 
-      const resp = await callOpenRouter(msgs, modelOverride);
+      const resp = await callOpenRouter(msgs, modelOverride, responseTokenBudget);
       if (resp.error) {
         console.error('OpenRouter error:', resp.error);
         sendSplit(client, channel, [`/me ignores you`], userId).catch(()=>{});
