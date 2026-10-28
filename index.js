@@ -551,10 +551,14 @@ client.on('message', async (channel, tags, message, self) => {
                 // Silently ignore banned users
                 return;
               }
+              const mentionIsAdmin = adminsCache.has(mentionUserId);
+              if (!mentionIsAdmin && await shouldLockdownWhenLive(channelKey)) {
+                console.log(`[${time}] Channel ${channelKey} is live or live status is unavailable; rejecting non-admin ${username} mention`);
+                return;
+              }
               // Check if channel has lockdown enabled
               const mentionChanCfg = channelsCache.get(channelKey) || { prefix: '!', require_admin: false };
               if (mentionChanCfg && mentionChanCfg.require_admin) {
-                const mentionIsAdmin = adminsCache.has(mentionUserId);
                 if (!mentionIsAdmin) {
                   // Silently ignore non-admins when channel is locked down
                   return;
@@ -565,7 +569,6 @@ client.on('message', async (channel, tags, message, self) => {
               const firstWord = remainder.split(/\s+/)[0].toLowerCase();
               if (firstWord === 'continue') {
                 // Handle continue command - separate cooldown from mention cooldown (skip for admins)
-                const mentionIsAdmin = adminsCache.has(mentionUserId);
                 if (!mentionIsAdmin) {
                   try {
                     const nowMs = Date.now();
@@ -605,7 +608,6 @@ client.on('message', async (channel, tags, message, self) => {
               }
               
               // Enforce per-user cooldown for mentions (treat as 'mention' command) - AFTER continue check (skip for admins)
-              const mentionIsAdmin = adminsCache.has(mentionUserId);
               if (!mentionIsAdmin) {
                 try {
                   const nowMs = Date.now();
@@ -692,17 +694,9 @@ client.on('message', async (channel, tags, message, self) => {
   }
 
   // Check online mode: if disabled, lock down when streamer is live
-  try {
-    const onlineModeEnabled = await db.getOnlineModeEnabled(channelKey);
-    if (!onlineModeEnabled) {
-      const isLive = await isChannelLive(channelKey);
-      if (isLive && !isAdmin) {
-        console.log(`[${time}] Channel ${channelKey} is online and online-mode is disabled; rejecting non-admin ${username} for '${command}'`);
-        return;
-      }
-    }
-  } catch (e) {
-    console.error('Online mode check error:', e);
+  if (!isAdmin && await shouldLockdownWhenLive(channelKey)) {
+    console.log(`[${time}] Channel ${channelKey} is live or live status is unavailable; rejecting non-admin ${username} for '${command}'`);
+    return;
   }
 
   // Enforce per-user, per-command cooldown (skip for admins)
@@ -1063,10 +1057,10 @@ client.on('message', async (channel, tags, message, self) => {
     };
   }
 
-  // Helper: check if a channel is currently streaming
+  // Helper: check if a channel is currently streaming. Unknown status is treated as live.
   function isChannelLive(channelName) {
     return new Promise((resolve) => {
-      if (!helixClientId) return resolve(false);
+      if (!helixClientId) return resolve(true);
       const token = String(process.env.TWITCH_OAUTH || '').replace(/^oauth:/i, '');
       const login = channelName.startsWith('#') ? channelName.slice(1) : channelName;
       const options = {
@@ -1082,18 +1076,33 @@ client.on('message', async (channel, tags, message, self) => {
         let data = '';
         res.on('data', (chunk) => data += chunk);
         res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) return resolve(true);
           try {
             const parsed = JSON.parse(data || '{}');
             if (parsed && Array.isArray(parsed.data) && parsed.data.length > 0) {
               return resolve(true); // Stream is live
             }
             return resolve(false);
-          } catch (e) { return resolve(false); }
+          } catch (e) { return resolve(true); }
         });
       });
-      req.on('error', (err) => resolve(false));
+      req.on('error', () => resolve(true));
+      req.setTimeout(5000, () => {
+        req.destroy();
+        resolve(true);
+      });
       req.end();
     });
+  }
+
+  async function shouldLockdownWhenLive(channelName) {
+    try {
+      const liveAccessEnabled = await db.getOnlineModeEnabled(channelName);
+      return !liveAccessEnabled && await isChannelLive(channelName);
+    } catch (err) {
+      console.error('Online mode check error:', err);
+      return true;
+    }
   }
 
   // Resolve an argument to a UID. Accepts a numeric uid or a username; returns uid or null.
@@ -1343,7 +1352,7 @@ client.on('message', async (channel, tags, message, self) => {
     });
   }
 
-  // Admin-only: toggle online mode (allow bot to work when streamer is online)
+  // Admin-only: toggle whether non-admins can use the bot while the streamer is live.
   if (command === 'enableonline') {
     if (!isAdmin) {
       queueSend(channel, `You are not authorized to run this command.`).catch(()=>{});
@@ -1351,8 +1360,7 @@ client.on('message', async (channel, tags, message, self) => {
     }
     try {
       const newState = await db.toggleOnlineMode(channelKey);
-      const status = newState ? 'enabled' : 'disabled';
-      queueSend(channel, `Online mode ${status}. Bot will ${newState ? 'work normally when streamer is live' : 'lockdown when streamer is online'}.`).catch(()=>{});
+      queueSend(channel, `Non-admin commands and @bot requests are now ${newState ? 'allowed' : 'blocked'} while the streamer is live.`).catch(()=>{});
     } catch (err) {
       console.error('Error toggling online mode:', err);
       sendSplit(client, channel, [`Failed to toggle online mode: ${err && err.message ? err.message : err}`]).catch(()=>{});
@@ -1425,7 +1433,7 @@ client.on('message', async (channel, tags, message, self) => {
       leave: `${pfx}leave <channel> - Leave channel (${effectiveAuth('leave')})`,
       addadmin: `${pfx}addadmin <uid/user> - Add a user as admin (${effectiveAuth('addadmin')})`,
       rmadmin: `${pfx}rmadmin <uid/user> - Remove a user from admins (${effectiveAuth('rmadmin')})`,
-      enableonline: `${pfx}enableonline - Allow/block bot when streamer is online (${effectiveAuth('enableonline')})`,
+      enableonline: `${pfx}enableonline - Toggle whether non-admin commands and @bot requests are allowed while the streamer is live (default: allowed) (${effectiveAuth('enableonline')})`,
       massping: `${pfx}massping - send single message of recent users (${effectiveAuth('massping')})`,
       ask: `${pfx}ask [--model MODEL] <question> - ask with recent channel chat as context (${effectiveAuth('ask')})`,
       askchat: `${pfx}askchat - print recent chat context (${effectiveAuth('askchat')})`,
